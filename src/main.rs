@@ -1,3 +1,67 @@
-fn main() {
-    println!("Hello, world!");
+mod canonical;
+mod coalesce;
+mod db;
+mod error;
+mod proxy;
+
+use axum::{routing::post, Router};
+use std::time::Duration;
+use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::{
+    coalesce::RequestCoalescer,
+    db::init_db_pool,
+    proxy::{handle_chat_completion, AppState},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "semcache=debug,axum=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let db_path = std::env::var("SEMCACHE_DB_PATH").unwrap_or_else(|_| "semcache.db".to_string());
+    let upstream_url = std::env::var("OPENAI_UPSTREAM_URL")
+        .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
+    let bind_addr = std::env::var("SEMCACHE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+
+    info!("Initializing SQLite WAL persistence layer at '{}'...", db_path);
+    let pool = init_db_pool(&db_path)?;
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .pool_max_idle_per_host(32)
+        .build()?;
+
+    let coalescer = RequestCoalescer::new();
+
+    let state = AppState {
+        db: pool,
+        http_client,
+        coalescer,
+        upstream_url,
+    };
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completion))
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    info!("🚀 SemCache Vector-Similarity Gateway active on http://{}", bind_addr);
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    info!("SemCache gateway shutdown cleanly.");
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
