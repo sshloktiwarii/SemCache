@@ -1,16 +1,9 @@
-mod canonical;
-mod coalesce;
-mod db;
-mod error;
-mod proxy;
-mod vector;
-
 use axum::{routing::post, Router};
 use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::{
+use semcache::{
     coalesce::RequestCoalescer,
     db::{init_db_pool, prune_expired_records},
     proxy::{handle_chat_completion, AppState},
@@ -34,24 +27,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
+    
+    // CRITICAL FIX (The 60-Second Guillotine):
+    // Reasoning models (e.g. o1-preview) and large code generation streams routinely take 90+ seconds.
+    // Defaulting to 300s prevents premature connection severance.
     let upstream_timeout_secs: u64 = std::env::var("SEMCACHE_UPSTREAM_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
+        .unwrap_or(300);
 
     info!("Initializing SQLite WAL persistence layer at '{}'...", db_path);
     let pool = init_db_pool(&db_path)?;
 
-    // CRITICAL FIX (Flaw #10): Strict upstream timeouts to prevent worker socket starvation
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(upstream_timeout_secs))
         .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(32)
+        .pool_max_idle_per_host(64)
         .build()?;
 
     let coalescer = RequestCoalescer::new();
 
-    // CRITICAL FIX (Flaw #9): Periodic background TTL pruning task
+    // Background TTL pruning task running hourly
     let prune_pool = pool.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));

@@ -5,26 +5,34 @@ use tokio::sync::broadcast;
 use crate::error::SemCacheError;
 
 pub type InFlightPayload = Result<Bytes, Arc<SemCacheError>>;
-pub type InFlightMap = Arc<DashMap<[u8; 32], broadcast::Sender<InFlightPayload>>>;
+
+#[derive(Clone, Debug)]
+pub enum CoalesceState {
+    Pending(broadcast::Sender<InFlightPayload>),
+    Ready(Bytes),
+}
+
+pub type InFlightMap = Arc<DashMap<[u8; 32], CoalesceState>>;
 
 #[derive(Clone, Default)]
 pub struct RequestCoalescer {
-    in_flight: InFlightMap,
+    pub in_flight: InFlightMap,
 }
 
 #[derive(Debug)]
 pub enum CoalesceResult {
-    /// The caller is the primary/leader worker responsible for fetching upstream and broadcasting.
+    /// The caller is the primary/leader worker responsible for fetching upstream.
     Primary(LeaderGuard),
     /// Another concurrent worker already fetched this request; the result is returned here.
     Coalesced(Bytes),
 }
 
 pub struct LeaderGuard {
-    hash: [u8; 32],
-    in_flight: InFlightMap,
-    tx: broadcast::Sender<InFlightPayload>,
-    completed: bool,
+    pub hash: [u8; 32],
+    pub in_flight: InFlightMap,
+    pub tx: broadcast::Sender<InFlightPayload>,
+    pub rx: broadcast::Receiver<InFlightPayload>,
+    pub completed: bool,
 }
 
 impl std::fmt::Debug for LeaderGuard {
@@ -37,23 +45,24 @@ impl std::fmt::Debug for LeaderGuard {
 }
 
 impl LeaderGuard {
-    /// Broadcasts success payload to all waiting followers.
+    /// Transitions state in InFlightMap to Ready(data) and broadcasts success to all pending followers.
     ///
-    /// CRITICAL FIX (Flaw #6): Remove the hash from `in_flight` map FIRST.
-    /// This closes the race window where a late-arriving request subscribes
-    /// after `send()` has already occurred and deadlocks.
-    pub fn broadcast_success(mut self, data: Bytes) {
+    /// CRITICAL FIX (The Persistence Gap):
+    /// Retaining Ready(Bytes) in InFlightMap ensures that any request arriving
+    /// during the async SQLite disk-commit window is served directly from memory,
+    /// eliminating redundant upstream calls.
+    pub fn mark_ready_and_broadcast(&mut self, data: Bytes) {
         self.completed = true;
-        // 1. Remove from map first so any subsequent arrival becomes a new leader
-        self.in_flight.remove(&self.hash);
-        // 2. Broadcast result to all currently awaiting subscribers
+        self.in_flight.insert(self.hash, CoalesceState::Ready(data.clone()));
         let _ = self.tx.send(Ok(data));
     }
 
+    /// Evicts the hash entry from InFlightMap after SQLite persistence commits.
+    pub fn evict(&self) {
+        self.in_flight.remove(&self.hash);
+    }
+
     /// Broadcasts upstream failure to all waiting followers.
-    ///
-    /// CRITICAL FIX (Flaw #2 & #5): Followers receive the exact upstream failure
-    /// rather than deadlocking or hanging on channel closure.
     pub fn broadcast_error(mut self, err: SemCacheError) {
         self.completed = true;
         self.in_flight.remove(&self.hash);
@@ -64,7 +73,6 @@ impl LeaderGuard {
 impl Drop for LeaderGuard {
     fn drop(&mut self) {
         if !self.completed {
-            // Leader aborted or dropped prematurely (e.g. client cancellation or panic)
             self.in_flight.remove(&self.hash);
             let _ = self.tx.send(Err(Arc::new(SemCacheError::UpstreamError(
                 502,
@@ -81,23 +89,30 @@ impl RequestCoalescer {
         }
     }
 
-    /// Atomically checks if an in-flight request exists for `hash` using DashMap entry shard locking.
-    ///
-    /// CRITICAL FIX (Flaw #1): Acquire the shard lock via `DashMap::entry(hash)`.
-    /// `Entry::Vacant` atomically becomes Primary Leader.
-    /// `Entry::Occupied` atomically subscribes to the leader's broadcast channel.
+    /// Atomically checks if an in-flight request exists for `hash`.
+    /// - If Ready(bytes) is present: returns immediately from memory (Persistence Gap closed).
+    /// - If Pending(tx) is present: subscribes and awaits broadcast.
+    /// - If Vacant: atomically inserts Pending and becomes Primary Leader.
     pub async fn register_or_wait(&self, hash: [u8; 32]) -> Result<CoalesceResult, SemCacheError> {
         let mut rx = {
             use dashmap::mapref::entry::Entry;
             match self.in_flight.entry(hash) {
-                Entry::Occupied(entry) => entry.get().subscribe(),
+                Entry::Occupied(entry) => {
+                    match entry.get() {
+                        CoalesceState::Ready(bytes) => {
+                            return Ok(CoalesceResult::Coalesced(bytes.clone()));
+                        }
+                        CoalesceState::Pending(tx) => tx.subscribe(),
+                    }
+                }
                 Entry::Vacant(entry) => {
-                    let (tx, _rx) = broadcast::channel(16);
-                    entry.insert(tx.clone());
+                    let (tx, rx) = broadcast::channel(64);
+                    entry.insert(CoalesceState::Pending(tx.clone()));
                     return Ok(CoalesceResult::Primary(LeaderGuard {
                         hash,
                         in_flight: self.in_flight.clone(),
                         tx,
+                        rx,
                         completed: false,
                     }));
                 }
@@ -132,7 +147,7 @@ mod tests {
         let hash = [42u8; 32];
 
         let primary_res = coalescer.register_or_wait(hash).await.unwrap();
-        let guard = match primary_res {
+        let mut guard = match primary_res {
             CoalesceResult::Primary(g) => g,
             _ => panic!("Expected primary worker"),
         };
@@ -149,10 +164,19 @@ mod tests {
         tokio::task::yield_now().await;
 
         let expected_payload = Bytes::from_static(b"{\"result\": \"success\"}");
-        guard.broadcast_success(expected_payload.clone());
+        guard.mark_ready_and_broadcast(expected_payload.clone());
 
         let coalesced_payload = handle.await.unwrap();
         assert_eq!(coalesced_payload, expected_payload);
+
+        // Immediate follow-up arrives before eviction (Persistence Gap check)
+        let follow_up = coalescer.register_or_wait(hash).await.unwrap();
+        match follow_up {
+            CoalesceResult::Coalesced(bytes) => assert_eq!(bytes, expected_payload),
+            _ => panic!("Expected immediate coalesced hit from Ready state"),
+        }
+
+        guard.evict();
         assert!(!coalescer.in_flight.contains_key(&hash));
     }
 
@@ -174,7 +198,6 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        // Leader broadcasts an upstream failure
         guard.broadcast_error(SemCacheError::UpstreamError(429, "Rate limit exceeded".to_string()));
 
         let follower_res = handle.await.unwrap();
@@ -207,7 +230,6 @@ mod tests {
 
         tokio::task::yield_now().await;
 
-        // Leader drops without explicit broadcast
         drop(guard);
 
         let follower_res = handle.await.unwrap();

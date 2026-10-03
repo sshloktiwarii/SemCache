@@ -23,12 +23,13 @@ pub struct AppState {
 
 /// Core HTTP proxy gateway handler for OpenAI chat completions.
 ///
-/// Implements:
-/// - Transparent Streaming Bypass (Flaw #11)
-/// - Multi-Tenant Authorization Isolation (Flaw #4)
-/// - Syntax-Preserving Canonicalization (Flaw #3)
-/// - Atomic Single-Flight Coalescing (Flaws #1, #2, #6)
-/// - Zero Error Cache Poisoning (Flaw #5)
+/// Production Hardened:
+/// - Leader Cancellation Immunity: Upstream fetch is detached in tokio::spawn
+/// - Persistence Gap Closed: Memory buffer transitions to Ready until SQLite commits
+/// - Multi-Tenant Authorization Isolation: Auth token salted into BLAKE3
+/// - Syntax-Preserving Canonicalization: Indentation & newlines preserved
+/// - Zero Error Cache Poisoning: Only HTTP 200 persisted
+/// - Non-Blocking Streaming Bypass: Direct SSE streaming for stream: true
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -36,7 +37,6 @@ pub async fn handle_chat_completion(
 ) -> Result<Response, SemCacheError> {
     let payload_bytes = serde_json::to_vec(&payload)?;
 
-    // Extract authorization header for tenant-isolated caching
     let auth_str = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
@@ -46,8 +46,7 @@ pub async fn handle_chat_completion(
     let hash = canonical_res.hash;
     let canonical_val = canonical_res.canonical_value;
 
-    // Step 1.1: CRITICAL FIX (Flaw #11 - Non-Blocking Streaming Bypass)
-    // If client requested streaming, bypass cache & coalescing to stream raw SSE chunks back.
+    // Step 1.1: Non-Blocking Streaming Bypass
     if canonical_res.is_streaming {
         let mut req_builder = state
             .http_client
@@ -94,8 +93,8 @@ pub async fn handle_chat_completion(
             .into_response());
     }
 
-    // Step 3: Single-Flight Request Coalescing (Atomic & Race-Free)
-    let leader_guard = match state.coalescer.register_or_wait(hash).await? {
+    // Step 3: Single-Flight Request Coalescing
+    let (mut rx, is_leader) = match state.coalescer.register_or_wait(hash).await? {
         CoalesceResult::Coalesced(coalesced_bytes) => {
             return Ok((
                 StatusCode::OK,
@@ -107,77 +106,106 @@ pub async fn handle_chat_completion(
             )
                 .into_response());
         }
-        CoalesceResult::Primary(guard) => guard,
-    };
+        CoalesceResult::Primary(mut guard) => {
+            let rx = guard.tx.subscribe();
+            let http_client = state.http_client.clone();
+            let upstream_url = state.upstream_url.clone();
+            let db_pool = state.db.clone();
+            let auth_header_opt = auth_str.map(|s| s.to_string());
+            let payload_bytes_clone = payload_bytes.clone();
+            let canonical_val_clone = canonical_val.clone();
 
-    // Step 4: Upstream Forwarding
-    let mut req_builder = state
-        .http_client
-        .post(&state.upstream_url)
-        .header(header::CONTENT_TYPE, "application/json");
+            // CRITICAL FIX (Leader Cancellation Immunity):
+            // Spawn the upstream fetch in a detached task. If this specific client disconnects,
+            // the background fetch continues, completes, persists to SQLite, and serves all followers.
+            tokio::spawn(async move {
+                let mut req_builder = http_client
+                    .post(&upstream_url)
+                    .header(header::CONTENT_TYPE, "application/json");
 
-    if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
-        req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
-    }
+                if let Some(auth_val) = auth_header_opt {
+                    req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
+                }
 
-    let upstream_resp = match req_builder.body(payload_bytes).send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            let err = SemCacheError::from(e);
-            leader_guard.broadcast_error(err.clone());
-            return Err(err);
+                let upstream_resp = match req_builder.body(payload_bytes_clone).send().await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        guard.broadcast_error(SemCacheError::from(e));
+                        return;
+                    }
+                };
+
+                let status = upstream_resp.status();
+                let resp_bytes = match upstream_resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        guard.broadcast_error(SemCacheError::from(e));
+                        return;
+                    }
+                };
+
+                if !status.is_success() {
+                    let err_msg = String::from_utf8_lossy(&resp_bytes).into_owned();
+                    guard.broadcast_error(SemCacheError::UpstreamError(status.as_u16(), err_msg));
+                    return;
+                }
+
+                // 1. Mark state in InFlightMap as Ready(bytes) & broadcast to current subscribers
+                guard.mark_ready_and_broadcast(resp_bytes.clone());
+
+                // 2. Persist to SQLite WAL asynchronously
+                let model = canonical_val_clone
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let req_json_str = canonical_val_clone.to_string();
+                let resp_json_str = String::from_utf8_lossy(&resp_bytes).into_owned();
+
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = insert_exact_cache(
+                        &db_pool,
+                        &hash,
+                        &model,
+                        &req_json_str,
+                        &resp_json_str,
+                    ) {
+                        tracing::error!("Failed to persist exact cache record: {}", e);
+                    }
+                })
+                .await;
+
+                // 3. Evict from memory once SQLite write commits
+                guard.evict();
+            });
+
+            (rx, true)
         }
     };
 
-    let status = upstream_resp.status();
-    let resp_bytes = match upstream_resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            let err = SemCacheError::from(e);
-            leader_guard.broadcast_error(err.clone());
-            return Err(err);
+    // Await response from the detached worker
+    let resp_bytes = match rx.recv().await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(err)) => return Err((*err).clone()),
+        Err(_) => {
+            return Err(SemCacheError::UpstreamError(
+                502,
+                "In-flight primary worker channel closed unexpectedly".to_string(),
+            ));
         }
     };
 
-    // Step 5: CRITICAL FIX (Flaw #5 - Never Poison Cache With Errors)
-    if !status.is_success() {
-        let err_msg = String::from_utf8_lossy(&resp_bytes).into_owned();
-        let upstream_err = SemCacheError::UpstreamError(status.as_u16(), err_msg);
-        // Broadcast the failure to any awaiting followers so they fail immediately
-        leader_guard.broadcast_error(upstream_err.clone());
-        return Err(upstream_err);
-    }
-
-    // Step 6: Asynchronous Persistence to SQLite WAL (Only 200 OK responses)
-    let pool_persist = state.db.clone();
-    let model = canonical_val
-        .get("model")
-        .and_then(|m| m.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let req_json_str = canonical_val.to_string();
-    let resp_json_str = String::from_utf8_lossy(&resp_bytes).into_owned();
-
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = insert_exact_cache(
-            &pool_persist,
-            &hash,
-            &model,
-            &req_json_str,
-            &resp_json_str,
-        ) {
-            tracing::error!("Failed to persist exact cache record: {}", e);
-        }
-    });
-
-    // Step 7: CRITICAL FIX (Flaw #6): Remove-First Broadcast to followers
-    leader_guard.broadcast_success(resp_bytes.clone());
+    let status_header = if is_leader {
+        "MISS_UPSTREAM"
+    } else {
+        "HIT_COALESCED"
+    };
 
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, "application/json"),
-            (header::HeaderName::from_static("x-semcache-status"), "MISS_UPSTREAM"),
+            (header::HeaderName::from_static("x-semcache-status"), status_header),
         ],
         resp_bytes,
     )
