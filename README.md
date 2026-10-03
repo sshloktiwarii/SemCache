@@ -86,6 +86,8 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 | `HIT_COALESCED` | Subscribed to a concurrent in-flight leader or retrieved from `Ready` memory. |
 | `MISS_UPSTREAM` | Primary leader worker forwarded request to upstream and cached response. |
 | `BYPASS_STREAM` | Streaming completion (`stream: true`) forwarded through watchdog proxy. |
+| `BYPASS_NO_STORE`| Request carried `Cache-Control: no-store`; bypassed cache and coalescing. |
+| `BYPASS_OVERSIZED`| Upstream response exceeded response size cap; bypassed cache without error. |
 
 ---
 
@@ -93,17 +95,32 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
-| `SEMCACHE_BIND` | `127.0.0.1:3000` | Loopback socket address for HTTP gateway. |
-| `SEMCACHE_DB_PATH` | `semcache.db` | Filepath for SQLite persistence database. |
+| `SEMCACHE_BIND` | `127.0.0.1:3000` | Loopback socket address. Set `0.0.0.0:3000` in Docker (see below). |
+| `SEMCACHE_DB_PATH` | `semcache.db` | Filepath for SQLite database (auto-permissions `0600` on Unix). |
 | `OPENAI_UPSTREAM_URL` | `https://api.openai.com/v1/chat/completions` | Target upstream LLM completion endpoint. |
-| `SEMCACHE_DEFAULT_PROVIDER` | `openai` | Default provider profile (`openai`, `ollama`, `generic`). |
+| `SEMCACHE_DEFAULT_PROVIDER` | `openai` | Authoritative provider profile (`openai`, `ollama`, `generic`). |
 | `SEMCACHE_TENANT_ID` | `default_tenant` | Fallback tenant identifier for unauthenticated endpoints. |
-| `SEMCACHE_MAX_REQUEST_BYTES` | `10485760` (10 MB) | Maximum accepted request payload size (returns 413 on breach). |
-| `SEMCACHE_MAX_RESPONSE_BYTES`| `10485760` (10 MB) | Maximum cached response size; larger payloads bypass cache. |
-| `SEMCACHE_MAX_CONCURRENT_WRITES` | `4` | Concurrency limit on SQLite writer tasks. |
-| `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` | `256` | Maximum concurrent upstream HTTP requests. |
-| `SEMCACHE_TTL_DAYS` | `7` | Cache entry retention window before automatic pruning. |
+| `SEMCACHE_MAX_REQUEST_BYTES` | `33554432` (32 MB) | Maximum request size (accommodates base64 vision images; HTTP 413). |
+| `SEMCACHE_MAX_RESPONSE_BYTES`| `10485760` (10 MB) | Maximum response size; larger payloads bypass cache via streaming. |
+| `SEMCACHE_MAX_READY_BYTES` | `134217728` (128 MB) | Bounded memory ceiling for in-flight `Ready` responses. |
+| `SEMCACHE_MAX_CONCURRENT_WRITES` | `4` | Concurrency limit on SQLite writer tasks with 5-failure circuit breaker. |
+| `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` | `256` | Upstream concurrency permit ceiling (returns HTTP 503 + Retry-After: 5 on shed). |
+| `SEMCACHE_TTL_DAYS` | `7` | Cache entry retention window before automatic pruning (`PRAGMA wal_checkpoint(TRUNCATE)`). |
 | `SEMCACHE_UPSTREAM_TIMEOUT_SECS` | `300` | Maximum overall upstream HTTP connection timeout. |
+
+---
+
+## Docker & Container Deployment
+
+> [!WARNING]
+> **Docker Binding & Network Security**
+> By default, SemCache binds to `127.0.0.1:3000` (loopback). Inside a Docker container, binding to `127.0.0.1` makes the gateway unreachable from the host or other containers on the Docker bridge network.
+> 
+> To run in Docker, you must set:
+> ```bash
+> -e SEMCACHE_BIND="0.0.0.0:3000"
+> ```
+> **CRITICAL SECURITY REQUIREMENT:** Never expose port 3000 directly to the public internet when bound to `0.0.0.0`. SemCache is an internal accelerating proxy. Always deploy it in a private subnet or front it with a secure reverse proxy (Nginx, Traefik, Envoy, Cloudflare Access) that terminates TLS and enforces ingress authentication.
 
 ---
 
@@ -137,12 +154,15 @@ curl http://127.0.0.1:3000/healthz
 ## Test Verification Suite
 
 ```bash
-# Run unit and integration tests (37 tests across all suites)
-cargo test
+# Run unit and integration tests (44 tests across all suites)
+cargo test --release
 
-# Run multi-threaded barrier stampede tests
-cargo test --test integration_tests
+# Run multi-threaded barrier stampede and governance tests
+cargo test --test integration_tests --release
 
-# Run sustained soak benchmark
-cargo test --test soak_test
+# Run sustained soak and stress benchmarks
+cargo test --test soak_test --release
+
+# Enforce zero clippy warnings and unwrap denials
+cargo clippy --all-targets -- -D warnings
 ```

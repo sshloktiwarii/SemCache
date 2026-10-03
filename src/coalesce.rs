@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use bytes::Bytes;
@@ -15,9 +16,17 @@ pub enum CoalesceState {
 
 pub type InFlightMap = Arc<DashMap<[u8; 32], CoalesceState>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RequestCoalescer {
     pub in_flight: InFlightMap,
+    pub ready_bytes_total: Arc<AtomicUsize>,
+    pub max_ready_bytes: usize,
+}
+
+impl Default for RequestCoalescer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +51,8 @@ pub struct LeaderGuard {
     pub tx: broadcast::Sender<InFlightPayload>,
     pub state: GuardState,
     pub completed: bool,
+    pub ready_bytes_total: Arc<AtomicUsize>,
+    pub max_ready_bytes: usize,
 }
 
 impl std::fmt::Debug for LeaderGuard {
@@ -60,17 +71,34 @@ impl LeaderGuard {
     /// CRITICAL FIX (The Persistence Gap & Unbounded Memory Leak):
     /// Storing a monotonic timestamp guarantees that memory entries are bounded and
     /// can be automatically evicted if SQLite writes hang or fail.
+    /// Also enforces `max_ready_bytes` to prevent RAM exhaustion from many large responses.
     pub fn mark_ready_and_broadcast(&mut self, data: Bytes) {
         self.state = GuardState::Ready;
         self.completed = true;
-        self.in_flight.insert(self.hash, CoalesceState::Ready(data.clone(), Instant::now()));
-        let _ = self.tx.send(Ok(data));
+        let data_len = data.len();
+
+        let current = self.ready_bytes_total.load(Ordering::Relaxed);
+        if current + data_len <= self.max_ready_bytes {
+            self.ready_bytes_total.fetch_add(data_len, Ordering::Relaxed);
+            self.in_flight.insert(self.hash, CoalesceState::Ready(data.clone(), Instant::now()));
+            let _ = self.tx.send(Ok(data));
+        } else {
+            tracing::warn!(
+                "Ready state memory cap reached ({}/{} bytes); broadcasting and bypassing RAM retention",
+                current + data_len,
+                self.max_ready_bytes
+            );
+            let _ = self.tx.send(Ok(data));
+            self.evict();
+        }
     }
 
     /// Evicts the hash entry from InFlightMap after SQLite persistence commits.
     pub fn evict(&mut self) {
         self.state = GuardState::Evicted;
-        self.in_flight.remove(&self.hash);
+        if let Some((_hash, CoalesceState::Ready(bytes, _))) = self.in_flight.remove(&self.hash) {
+            self.ready_bytes_total.fetch_sub(bytes.len(), Ordering::Relaxed);
+        }
     }
 
     /// Checks if there are any active clients awaiting this request.
@@ -87,7 +115,9 @@ impl LeaderGuard {
     pub fn broadcast_error(mut self, err: SemCacheError) {
         self.state = GuardState::Evicted;
         self.completed = true;
-        self.in_flight.remove(&self.hash);
+        if let Some((_hash, CoalesceState::Ready(bytes, _))) = self.in_flight.remove(&self.hash) {
+            self.ready_bytes_total.fetch_sub(bytes.len(), Ordering::Relaxed);
+        }
         let _ = self.tx.send(Err(Arc::new(err)));
     }
 }
@@ -107,9 +137,19 @@ impl Drop for LeaderGuard {
 
 impl RequestCoalescer {
     pub fn new() -> Self {
+        Self::with_max_ready_bytes(128 * 1024 * 1024) // 128 MB default
+    }
+
+    pub fn with_max_ready_bytes(max_ready_bytes: usize) -> Self {
         Self {
             in_flight: Arc::new(DashMap::new()),
+            ready_bytes_total: Arc::new(AtomicUsize::new(0)),
+            max_ready_bytes,
         }
+    }
+
+    pub fn ready_bytes(&self) -> usize {
+        self.ready_bytes_total.load(Ordering::Relaxed)
     }
 
     /// Atomically checks if an in-flight request exists for `hash`.
@@ -129,6 +169,8 @@ impl RequestCoalescer {
                                 return Ok(CoalesceResult::Coalesced(bytes.clone()));
                             } else {
                                 // Stale entry; evict and create a fresh cycle
+                                let bytes_len = bytes.len();
+                                self.ready_bytes_total.fetch_sub(bytes_len, Ordering::Relaxed);
                                 let (tx, _rx) = broadcast::channel(64);
                                 let leader_rx = tx.subscribe();
                                 drop(_rx);
@@ -140,6 +182,8 @@ impl RequestCoalescer {
                                         tx,
                                         state: GuardState::Pending,
                                         completed: false,
+                                        ready_bytes_total: self.ready_bytes_total.clone(),
+                                        max_ready_bytes: self.max_ready_bytes,
                                     },
                                     leader_rx,
                                 ));
@@ -160,6 +204,8 @@ impl RequestCoalescer {
                             tx,
                             state: GuardState::Pending,
                             completed: false,
+                            ready_bytes_total: self.ready_bytes_total.clone(),
+                            max_ready_bytes: self.max_ready_bytes,
                         },
                         leader_rx,
                     ));
@@ -189,8 +235,9 @@ impl RequestCoalescer {
     pub fn sweep_stale_ready(&self, ttl: Duration) -> usize {
         let mut swept = 0;
         self.in_flight.retain(|_hash, state| {
-            if let CoalesceState::Ready(_, timestamp) = state {
+            if let CoalesceState::Ready(bytes, timestamp) = state {
                 if timestamp.elapsed() >= ttl {
+                    self.ready_bytes_total.fetch_sub(bytes.len(), Ordering::Relaxed);
                     swept += 1;
                     return false;
                 }
@@ -357,5 +404,47 @@ mod tests {
         let swept = coalescer.sweep_stale_ready(Duration::from_millis(0));
         assert_eq!(swept, 1);
         assert_eq!(coalescer.in_flight.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ready_memory_budget_enforcement() {
+        // Coalescer with a tiny 100-byte budget
+        let coalescer = RequestCoalescer::with_max_ready_bytes(100);
+        let hash1 = [1u8; 32];
+        let hash2 = [2u8; 32];
+
+        // First payload: 60 bytes (within budget)
+        let primary1 = coalescer.register_or_wait(hash1).await.unwrap();
+        let (mut guard1, _rx1) = match primary1 {
+            CoalesceResult::Primary(g, rx) => (g, rx),
+            _ => panic!("Expected primary"),
+        };
+        let payload1 = Bytes::from(vec![1u8; 60]);
+        guard1.mark_ready_and_broadcast(payload1);
+
+        assert_eq!(coalescer.ready_bytes(), 60);
+        assert!(coalescer.in_flight.contains_key(&hash1));
+
+        // Second payload: 50 bytes (60 + 50 = 110 > 100 budget -> exceeds!)
+        let primary2 = coalescer.register_or_wait(hash2).await.unwrap();
+        let (mut guard2, mut rx2) = match primary2 {
+            CoalesceResult::Primary(g, rx) => (g, rx),
+            _ => panic!("Expected primary"),
+        };
+        let payload2 = Bytes::from(vec![2u8; 50]);
+        guard2.mark_ready_and_broadcast(payload2.clone());
+
+        // Follower/leader receiver still receives the bytes
+        let recv2 = rx2.recv().await.unwrap().unwrap();
+        assert_eq!(recv2, payload2);
+
+        // But entry is NOT held in in_flight Ready cache
+        assert!(!coalescer.in_flight.contains_key(&hash2));
+        assert_eq!(coalescer.ready_bytes(), 60);
+
+        // Evicting guard1 decrements to 0
+        guard1.evict();
+        assert_eq!(coalescer.ready_bytes(), 0);
+        assert!(!coalescer.in_flight.contains_key(&hash1));
     }
 }

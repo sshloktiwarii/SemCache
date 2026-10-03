@@ -36,12 +36,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_request_bytes: usize = std::env::var("SEMCACHE_MAX_REQUEST_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10 * 1024 * 1024); // 10 MB default
+        .unwrap_or(32 * 1024 * 1024); // 32 MB default (supports vision models with base64 images)
 
     let max_response_bytes: usize = std::env::var("SEMCACHE_MAX_RESPONSE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(10 * 1024 * 1024); // 10 MB default
+
+    let max_ready_bytes: usize = std::env::var("SEMCACHE_MAX_READY_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128 * 1024 * 1024); // 128 MB default for Ready RAM retention
 
     let max_upstream_concurrency: usize = std::env::var("SEMCACHE_MAX_UPSTREAM_CONCURRENCY")
         .ok()
@@ -58,7 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
 
-    info!("Initializing SQLite WAL persistence layer at '{}'...", db_path);
+    let canonical_db_path = std::path::Path::new(&db_path)
+        .canonicalize()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| db_path.clone());
+    info!("Initializing SQLite WAL persistence layer at '{}'...", canonical_db_path);
     let pool = init_db_pool(&db_path)?;
 
     let http_client = reqwest::Client::builder()
@@ -67,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .pool_max_idle_per_host(64)
         .build()?;
 
-    let coalescer = RequestCoalescer::new();
+    let coalescer = RequestCoalescer::with_max_ready_bytes(max_ready_bytes);
 
     // Background sweep task for expired Ready entries in InFlightMap (every 10s)
     let coalescer_sweep = coalescer.clone();
@@ -77,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
             let swept = coalescer_sweep.sweep_stale_ready(Duration::from_secs(10));
             if swept > 0 {
-                tracing::debug!("Swept {} stale ready entries from InFlightMap", swept);
+                tracing::debug!("Swept {} stale ready entries from InFlightMap (current ready bytes: {})", swept, coalescer_sweep.ready_bytes());
             }
         }
     });
@@ -120,6 +129,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => semcache::canonical::Provider::OpenAi,
     };
 
+    let upstream_shed_total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_writes_total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let consecutive_write_failures = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     let state = AppState {
         db: pool,
         http_client,
@@ -132,12 +145,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_request_bytes,
         max_response_bytes,
         cancel_orphan_requests,
+        upstream_shed_total,
+        dropped_writes_total,
+        consecutive_write_failures,
     };
 
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completion))
         .route("/healthz", get(handle_healthz))
         .with_state(state);
+
+    if bind_addr.starts_with("127.0.0.1") {
+        info!("Notice: Bound to loopback interface ({}). In Docker environments, set SEMCACHE_BIND=0.0.0.0:3000 behind a secure reverse proxy.", bind_addr);
+    }
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!("🚀 SemCache Vector-Similarity Gateway active on http://{}", bind_addr);

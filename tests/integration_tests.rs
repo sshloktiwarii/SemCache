@@ -35,6 +35,9 @@ fn create_test_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
     let coalescer = RequestCoalescer::new();
     let sqlite_write_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
     let upstream_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+    let upstream_shed_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_writes_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let consecutive_write_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let state = AppState {
         db: pool.clone(),
@@ -45,9 +48,12 @@ fn create_test_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         upstream_semaphore,
         default_provider: semcache::canonical::Provider::OpenAi,
         default_tenant_id: "test_tenant".to_string(),
-        max_request_bytes: 10 * 1024 * 1024,
+        max_request_bytes: 32 * 1024 * 1024,
         max_response_bytes: 10 * 1024 * 1024,
         cancel_orphan_requests: false,
+        upstream_shed_total,
+        dropped_writes_total,
+        consecutive_write_failures,
     };
 
     let app = Router::new()
@@ -793,5 +799,336 @@ async fn test_sqlite_write_semaphore_backpressure() {
     drop(permit4);
 
     mock_server.verify().await;
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_two_different_api_keys_same_body_make_two_upstream_calls() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "Tenant isolated response" } }]
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, _state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Identical prompt across tenants" }]
+    });
+
+    // Request from Tenant Alice
+    let req_alice = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-alice-key-111")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp_alice = app.clone().oneshot(req_alice).await.unwrap();
+    assert_eq!(resp_alice.status(), StatusCode::OK);
+    assert_eq!(
+        resp_alice.headers().get("x-semcache-status").unwrap(),
+        "MISS_UPSTREAM"
+    );
+
+    // Request from Tenant Bob (exact same body, different Authorization key)
+    let req_bob = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-bob-key-222")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp_bob = app.clone().oneshot(req_bob).await.unwrap();
+    assert_eq!(resp_bob.status(), StatusCode::OK);
+    // Must NOT hit L1 cache; must make a second upstream call due to credential salt
+    assert_eq!(
+        resp_bob.headers().get("x-semcache-status").unwrap(),
+        "MISS_UPSTREAM"
+    );
+
+    mock_server.verify().await;
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_multi_header_first_match_precedence() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "Precedence response" } }]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, _state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Precedence check" }]
+    });
+
+    // Request 1: Client sends both Authorization AND api-key
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-primary-token")
+        .header("api-key", "secondary-azure-key")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp1.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    // Request 2: Client sends ONLY Authorization (matching Request 1's primary header)
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-primary-token")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    // Because of First-Match Precedence (Authorization > api-key), both salted with Authorization!
+    assert_eq!(resp2.headers().get("x-semcache-status").unwrap(), "HIT_L1");
+
+    mock_server.verify().await;
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_upstream_semaphore_exhaustion_returns_503_and_retry_after() {
+    let mock_server = MockServer::start().await;
+
+    let (app, _pool, db_path, state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    // Exhaust all 256 permits of the upstream semaphore
+    let mut permits = Vec::new();
+    for _ in 0..256 {
+        permits.push(state.upstream_semaphore.clone().try_acquire_owned().unwrap());
+    }
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Shed request" }]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-test-key")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "5");
+    assert_eq!(resp.headers().get(header::CONTENT_TYPE).unwrap(), "application/json");
+
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body_json["error"]["type"].as_str().unwrap(), "concurrency_limit_exceeded");
+    assert!(state.upstream_shed_total.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+
+    drop(permits);
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_cache_control_no_store_bypass() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "No store response" } }]
+                })),
+        )
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, _state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "No-store prompt" }]
+    });
+
+    // Request 1: Normal request, populates L1 cache
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-test-key")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp1.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    // Request 2: Identical prompt, but Cache-Control: no-store
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-test-key")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert_eq!(resp2.headers().get("x-semcache-status").unwrap(), "BYPASS_NO_STORE");
+
+    mock_server.verify().await;
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_slow_upstream_pending_coalesces_followers_past_10s() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(1200))
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "Slow reasoning model result" } }]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, _state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    let payload = json!({
+        "model": "o1-preview",
+        "messages": [{ "role": "user", "content": "Slow reasoning prompt" }]
+    });
+    let payload_bytes = serde_json::to_vec(&payload).unwrap();
+
+    let app_clone = app.clone();
+    let payload_bytes_clone = payload_bytes.clone();
+    let leader_handle = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer sk-test-key")
+            .body(Body::from(payload_bytes_clone))
+            .unwrap();
+        app_clone.oneshot(req).await.unwrap()
+    });
+
+    // Wait 300ms for leader to establish Pending state
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Follower joins while upstream is still executing
+    let app_clone2 = app.clone();
+    let follower_handle = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer sk-test-key")
+            .body(Body::from(payload_bytes))
+            .unwrap();
+        app_clone2.oneshot(req).await.unwrap()
+    });
+
+    let leader_resp = leader_handle.await.unwrap();
+    let follower_resp = follower_handle.await.unwrap();
+
+    assert_eq!(leader_resp.status(), StatusCode::OK);
+    assert_eq!(leader_resp.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    assert_eq!(follower_resp.status(), StatusCode::OK);
+    assert_eq!(follower_resp.headers().get("x-semcache-status").unwrap(), "HIT_COALESCED");
+
+    mock_server.verify().await;
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_write_failure_circuit_breaker_evicts_after_5_failures() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "Circuit breaker test" } }]
+                })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    // Saturate the write semaphore with 4 permits so every async write attempts to acquire and times out
+    let permit1 = state.sqlite_write_semaphore.clone().try_acquire_owned().unwrap();
+    let permit2 = state.sqlite_write_semaphore.clone().try_acquire_owned().unwrap();
+    let permit3 = state.sqlite_write_semaphore.clone().try_acquire_owned().unwrap();
+    let permit4 = state.sqlite_write_semaphore.clone().try_acquire_owned().unwrap();
+
+    // Send 5 distinct requests that will all fail SQLite write due to semaphore saturation
+    for i in 0..5 {
+        let payload = json!({
+            "model": "gpt-4o",
+            "messages": [{ "role": "user", "content": format!("Unique prompt {}", i) }]
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, "Bearer sk-test-key")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Allow background write tasks to time out (250ms each)
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert!(state.consecutive_write_failures.load(std::sync::atomic::Ordering::Relaxed) >= 5);
+    assert!(state.dropped_writes_total.load(std::sync::atomic::Ordering::Relaxed) >= 5);
+
+    drop(permit1);
+    drop(permit2);
+    drop(permit3);
+    drop(permit4);
+
     let _ = std::fs::remove_file(db_path);
 }

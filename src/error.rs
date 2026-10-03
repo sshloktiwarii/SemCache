@@ -26,6 +26,9 @@ pub enum SemCacheError {
     #[error("Upstream concurrency limit exceeded: {0}")]
     ConcurrencyLimitExceeded(String),
 
+    #[error("Upstream response oversized; bypass coalescing")]
+    UpstreamOversizedBypass,
+
     #[error("Upstream provider returned status {0}: {1}")]
     UpstreamError(u16, String),
 
@@ -59,9 +62,28 @@ impl From<serde_json::Error> for SemCacheError {
 
 impl IntoResponse for SemCacheError {
     fn into_response(self) -> Response {
+        if let SemCacheError::ConcurrencyLimitExceeded(ref msg) = self {
+            let body = Json(json!({
+                "error": {
+                    "message": msg,
+                    "type": "concurrency_limit_exceeded"
+                }
+            }));
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (axum::http::header::RETRY_AFTER, "5"),
+                    (axum::http::header::CONTENT_TYPE, "application/json"),
+                ],
+                body,
+            )
+                .into_response();
+        }
+
         let (status, error_type) = match &self {
             SemCacheError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
-            SemCacheError::ConcurrencyLimitExceeded(_) => (StatusCode::TOO_MANY_REQUESTS, "concurrency_limit_exceeded"),
+            SemCacheError::ConcurrencyLimitExceeded(_) => unreachable!(),
+            SemCacheError::UpstreamOversizedBypass => (StatusCode::BAD_GATEWAY, "upstream_oversized"),
             SemCacheError::UpstreamError(code, _) => {
                 let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_GATEWAY);
                 (status, "upstream_error")

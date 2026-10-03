@@ -80,31 +80,36 @@ The gateway proxy is implemented using `axum 0.7`, `tokio 1.36`, and `reqwest 0.
 
 ### Request Pipeline Flow
 1. **Payload Extraction & Streaming Interception:**
-   - Ingress `POST /v1/chat/completions` request body is parsed into a `serde_json::Value`.
-   - If `stream == true`, the request is routed immediately to `forward_stream_bypass`, tunneling SSE chunks directly to the client while enforcing a 180-second TTFB and 30-second inter-chunk watchdog. The response is tagged with header `x-semcache-status: BYPASS_STREAM`.
-2. **Provider Resolution & Canonicalization:**
-   - Provider is resolved from `x-semcache-provider` header, upstream URL heuristics, or application default (`AppState::default_provider`).
-   - The payload is canonicalized via `canonicalize_and_hash(&payload_bytes, auth_header, provider)`.
+   - Ingress `POST /v1/chat/completions` request body is parsed into a `serde_json::Value` (enforcing 32MB default limit).
+   - If `Cache-Control: no-store` or `x-semcache-no-store` is present, the request bypasses L1 cache and coalescing, streaming directly from upstream with header `x-semcache-status: BYPASS_NO_STORE`.
+   - If `stream == true`, the request acquires an upstream permit and routes to `IdleTimeoutStream`, tunneling SSE chunks directly to the client while enforcing a 180-second TTFB and 30-second inter-chunk watchdog. The response is tagged with header `x-semcache-status: BYPASS_STREAM`.
+2. **Authoritative Provider Resolution & Canonicalization:**
+   - Provider is resolved strictly from server-side configuration (`AppState::default_provider`), ignoring client `x-semcache-provider` headers to eradicate client-driven cache-partitioning DoS vectors.
+   - The payload is canonicalized via `canonicalize_and_hash(&payload_bytes, auth_salt, provider)`.
 3. **L1 Cache Lookup:**
    - The 32-byte BLAKE3 hash is queried against SQLite `exact_cache` within `tokio::task::spawn_blocking`.
-   - If found: Returns HTTP 200 with `x-semcache-status: HIT_L1` ($< 1.5\text{ms}$).
+   - If found: Returns HTTP 200 with `x-semcache-status: HIT_L1` ($< 1.5\text{ms}$). Note that L1 hits never acquire or consume upstream semaphore permits.
 4. **Coalesce State Registration (`register_or_wait`):**
    - If L1 misses, the worker acquires a DashMap shard entry lock:
      - **Follower (Pending):** Subscribes to the broadcast channel and awaits completion.
-     - **Follower (Ready):** Retrieves the completed response immediately from memory.
+     - **Follower (Ready):** Retrieves the completed response immediately from bounded `Ready` RAM.
      - **Primary Leader:** Instantiates `LeaderGuard` and proceeds to upstream execution.
-5. **Upstream Forwarding & Dual-Stage Timeout:**
+5. **Upstream Forwarding & Semaphore Bounding:**
    - The leader checks active receiver count (`tx.receiver_count()`). If client disconnected and zero followers wait, execution aborts to save upstream tokens.
-   - Forwards request via connection-pooled `reqwest::Client` (5s connect timeout).
-   - If upstream returns non-2xx status code: drops `LeaderGuard` (broadcasting error to followers) and propagates status code and error payload without caching.
-6. **Memory State Transition & Broadcast:**
+   - Acquires permit from `upstream_semaphore` (256 permits, 5s timeout). If saturated, returns **HTTP 503 Service Unavailable** with **`Retry-After: 5`** to both leader and followers.
+   - Forwards request via connection-pooled `reqwest::Client`.
+   - If upstream returns non-2xx status code: broadcasts error to followers and propagates status code without caching.
+6. **Streaming Response Size Enforcement:**
+   - Chunks are read from upstream using `bytes_stream()`. If cumulative bytes exceed `SEMCACHE_MAX_RESPONSE_BYTES` (10MB), buffering is aborted.
+   - Waiting followers receive `UpstreamOversizedBypass`, causing them to transparently forward directly upstream with header `x-semcache-status: BYPASS_OVERSIZED`.
+7. **Memory State Transition & Broadcast:**
    - On 2xx response, leader calls `leader_guard.mark_ready_and_broadcast(resp_bytes)`.
-   - Transitions state to `InFlightState::Ready(resp_bytes)` and broadcasts payload to all waiting followers.
-7. **Bounded Asynchronous Persistence:**
-   - Dispatches background SQLite write task governed by `AppState::sqlite_write_semaphore` (4 permits, 250ms acquisition timeout).
-   - Leader awaits write task completion (`let _ = write_handle.await;`).
-8. **Eviction:**
-   - Leader invokes `leader_guard.evict()`, removing the entry from the in-flight map.
+   - Transitions state to `CoalesceState::Ready(resp_bytes, Instant::now())` within `SEMCACHE_MAX_READY_BYTES` (128MB budget) and broadcasts to all waiting followers.
+8. **Bounded Asynchronous Persistence & Circuit Breaker:**
+   - Dispatches background SQLite write task governed by `sqlite_write_semaphore` (4 permits, 250ms acquisition timeout).
+   - If 5 consecutive writes fail or time out, the circuit breaker trips: `Ready` RAM retention is disabled, and entries are immediately evicted to prevent memory bloat during persistent disk failure.
+9. **Eviction:**
+   - Leader invokes `leader_guard.evict()`, safely removing the entry from the in-flight map.
    - Returns response with `x-semcache-status: MISS_UPSTREAM`.
 
 ---
@@ -131,16 +136,23 @@ Code generation prompts are hypersensitive to whitespace manipulation. SemCache 
 - Outermost edges of message `content` and `prompt` strings are trimmed.
 - **Internal indentation, newlines, tabs, and line feeds are preserved 100% verbatim.**
 
-### Tenant-Salted BLAKE3 Key Derivation
+### Tenant-Salted BLAKE3 Key Derivation & First-Match Precedence
+Credential salting evaluates headers with strict First-Match Precedence:
+$$\text{Authorization} \succ \text{api-key} \succ \text{x-api-key} \succ \text{SEMCACHE\_TENANT\_ID}$$
+
 ```rust
+let auth_str = headers
+    .get(header::AUTHORIZATION)
+    .or_else(|| headers.get("api-key"))
+    .or_else(|| headers.get("x-api-key"))
+    .and_then(|h| h.to_str().ok());
+
+let tenant_salt = auth_str.unwrap_or(&state.default_tenant_id);
+
 let mut hasher = blake3::Hasher::new();
 hasher.update(&canonical_json_bytes);
 hasher.update(b"|auth_tenant:");
-if let Some(auth) = auth_header {
-    hasher.update(auth.trim().as_bytes());
-} else {
-    hasher.update(b"anonymous");
-}
+hasher.update(tenant_salt.trim().as_bytes());
 let hash: [u8; 32] = *hasher.finalize().as_bytes();
 ```
 

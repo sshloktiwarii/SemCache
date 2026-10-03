@@ -66,6 +66,17 @@ pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
         )?;
     }
 
+    // Enforce strict file permissions (0600) on Unix platforms for data-at-rest protection
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(db_path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(db_path, perms);
+        }
+    }
+
     Ok(pool)
 }
 

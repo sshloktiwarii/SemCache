@@ -55,6 +55,9 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
     let coalescer = RequestCoalescer::new();
     let sqlite_write_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
     let upstream_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
+    let upstream_shed_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_writes_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let consecutive_write_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     let state = AppState {
         db: pool.clone(),
@@ -65,9 +68,12 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         upstream_semaphore,
         default_provider: semcache::canonical::Provider::OpenAi,
         default_tenant_id: "soak_tenant".to_string(),
-        max_request_bytes: 10 * 1024 * 1024,
+        max_request_bytes: 32 * 1024 * 1024,
         max_response_bytes: 10 * 1024 * 1024,
         cancel_orphan_requests: false,
+        upstream_shed_total,
+        dropped_writes_total,
+        consecutive_write_failures,
     };
 
     let app = Router::new()

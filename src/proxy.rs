@@ -4,10 +4,12 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use futures_util::Stream;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -34,6 +36,9 @@ pub struct AppState {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub cancel_orphan_requests: bool,
+    pub upstream_shed_total: Arc<AtomicU64>,
+    pub dropped_writes_total: Arc<AtomicU64>,
+    pub consecutive_write_failures: Arc<AtomicUsize>,
 }
 
 /// A stream wrapper that enforces a dual-stage timeout:
@@ -116,6 +121,64 @@ pub async fn handle_healthz() -> impl IntoResponse {
     )
 }
 
+/// Forwards a request directly to upstream, bypassing cache storage and coalescing.
+/// Used for `Cache-Control: no-store` and for oversized responses (> max_response_bytes).
+pub async fn forward_direct_upstream(
+    state: &AppState,
+    headers: &HeaderMap,
+    payload_bytes: Vec<u8>,
+    status_tag: &'static str,
+) -> Result<Response, SemCacheError> {
+    let _upstream_permit = match tokio::time::timeout(
+        Duration::from_secs(5),
+        state.upstream_semaphore.clone().acquire_owned(),
+    )
+    .await {
+        Ok(Ok(permit)) => permit,
+        _ => {
+            state.upstream_shed_total.fetch_add(1, Ordering::Relaxed);
+            return Err(SemCacheError::ConcurrencyLimitExceeded(
+                "Gateway upstream concurrency saturated".into(),
+            ));
+        }
+    };
+
+    let mut req_builder = state
+        .http_client
+        .post(&state.upstream_url)
+        .header(header::CONTENT_TYPE, "application/json");
+
+    if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
+        req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
+    }
+    if let Some(key_val) = headers.get("api-key") {
+        req_builder = req_builder.header("api-key", key_val);
+    }
+    if let Some(x_key_val) = headers.get("x-api-key") {
+        req_builder = req_builder.header("x-api-key", x_key_val);
+    }
+
+    let upstream_resp = req_builder.body(payload_bytes).send().await?;
+    let status = upstream_resp.status();
+
+    if !status.is_success() {
+        let err_bytes = upstream_resp.bytes().await.unwrap_or_default();
+        let err_msg = String::from_utf8_lossy(&err_bytes).into_owned();
+        return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
+    }
+
+    let resp_bytes = upstream_resp.bytes().await?;
+    Ok((
+        status,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::HeaderName::from_static("x-semcache-status"), status_tag),
+        ],
+        resp_bytes,
+    )
+        .into_response())
+}
+
 /// Core HTTP proxy gateway handler for LLM chat completions.
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
@@ -124,7 +187,7 @@ pub async fn handle_chat_completion(
 ) -> Result<Response, SemCacheError> {
     let payload_bytes = serde_json::to_vec(&payload)?;
 
-    // Enforce maximum inbound request body size
+    // Enforce maximum inbound request body size (32MB default for multimodal vision payloads)
     if payload_bytes.len() > state.max_request_bytes {
         return Err(SemCacheError::PayloadTooLarge(format!(
             "Request payload of {} bytes exceeds configured limit of {} bytes",
@@ -133,7 +196,23 @@ pub async fn handle_chat_completion(
         )));
     }
 
-    // Salt across all credential headers (Authorization, api-key, x-api-key)
+    // Cache-Control: no-store or x-semcache-no-store bypass
+    let no_store = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.contains("no-store"))
+        .unwrap_or(false)
+        || headers
+            .get("x-semcache-no-store")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false);
+
+    if no_store {
+        return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_NO_STORE").await;
+    }
+
+    // Salt across credential headers with First-Match Precedence (Authorization > api-key > x-api-key).
     // If no credential header is provided, namespace under server default tenant ID.
     let auth_str = headers
         .get(header::AUTHORIZATION)
@@ -152,13 +231,17 @@ pub async fn handle_chat_completion(
 
     // Step 1: Non-Blocking Streaming Bypass with Dual-Stage TTFB/Inter-Chunk Timeout
     if canonical_res.is_streaming {
-        let _upstream_permit = tokio::time::timeout(
+        let _upstream_permit = match tokio::time::timeout(
             Duration::from_secs(5),
             state.upstream_semaphore.clone().acquire_owned(),
         )
-        .await
-        .map_err(|_| SemCacheError::ConcurrencyLimitExceeded("Gateway upstream concurrency saturated".into()))?
-        .map_err(|e| SemCacheError::InternalError(format!("Semaphore acquire error: {e}")))?;
+        .await {
+            Ok(Ok(permit)) => permit,
+            _ => {
+                state.upstream_shed_total.fetch_add(1, Ordering::Relaxed);
+                return Err(SemCacheError::ConcurrencyLimitExceeded("Gateway upstream concurrency saturated".into()));
+            }
+        };
 
         let mut req_builder = state
             .http_client
@@ -179,7 +262,7 @@ pub async fn handle_chat_completion(
         let status = upstream_resp.status();
 
         if !status.is_success() {
-            let err_bytes = upstream_resp.bytes().await?;
+            let err_bytes = upstream_resp.bytes().await.unwrap_or_default();
             let err_msg = String::from_utf8_lossy(&err_bytes).into_owned();
             return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
         }
@@ -199,6 +282,7 @@ pub async fn handle_chat_completion(
     }
 
     // Step 2: L1 Exact Match Cache Lookup (with Fail-Open Degradation on SQLite Read Error)
+    // Note: L1 hits never acquire or touch the upstream semaphore.
     let pool_clone = state.db.clone();
     let l1_hit = match tokio::task::spawn_blocking(move || get_exact_cache(&pool_clone, &hash)).await {
         Ok(Ok(cached)) => cached,
@@ -250,6 +334,9 @@ pub async fn handle_chat_completion(
             let upstream_semaphore = state.upstream_semaphore.clone();
             let max_response_bytes = state.max_response_bytes;
             let cancel_orphan_requests = state.cancel_orphan_requests;
+            let upstream_shed_total = state.upstream_shed_total.clone();
+            let dropped_writes_total = state.dropped_writes_total.clone();
+            let consecutive_write_failures = state.consecutive_write_failures.clone();
 
             tokio::spawn(async move {
                 // Post-Dispatch Ghost Task Policy:
@@ -268,6 +355,7 @@ pub async fn handle_chat_completion(
                 ).await {
                     Ok(Ok(permit)) => permit,
                     _ => {
+                        upstream_shed_total.fetch_add(1, Ordering::Relaxed);
                         guard.broadcast_error(SemCacheError::ConcurrencyLimitExceeded(
                             "Gateway upstream concurrency saturated".into(),
                         ));
@@ -298,36 +386,54 @@ pub async fn handle_chat_completion(
                 };
 
                 let status = upstream_resp.status();
-                let resp_bytes = match upstream_resp.bytes().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        guard.broadcast_error(SemCacheError::from(e));
-                        return;
-                    }
-                };
-
                 if !status.is_success() {
-                    let err_msg = String::from_utf8_lossy(&resp_bytes).into_owned();
+                    let err_bytes = upstream_resp.bytes().await.unwrap_or_default();
+                    let err_msg = String::from_utf8_lossy(&err_bytes).into_owned();
                     guard.broadcast_error(SemCacheError::UpstreamError(status.as_u16(), err_msg));
                     return;
                 }
 
-                // If response exceeds max_response_bytes, do not hold in Ready RAM or cache in SQLite
-                if resp_bytes.len() > max_response_bytes {
+                // Enforce response size while streaming chunks to avoid buffering oversized bodies into RAM
+                let content_length = upstream_resp.content_length();
+                if content_length.is_some_and(|len| len > max_response_bytes as u64) {
                     tracing::warn!(
-                        "Response size ({} bytes) exceeds limit ({} bytes); bypassing cache storage",
-                        resp_bytes.len(),
+                        "Upstream Content-Length ({} bytes) exceeds limit ({} bytes); signaling bypass to followers",
+                        content_length.unwrap_or(0),
                         max_response_bytes
                     );
-                    let _ = guard.tx.send(Ok(resp_bytes));
-                    guard.evict();
+                    guard.broadcast_error(SemCacheError::UpstreamOversizedBypass);
                     return;
                 }
+
+                let mut stream = upstream_resp.bytes_stream();
+                let mut accumulated_bytes = Vec::new();
+
+                while let Some(chunk_res) = stream.next().await {
+                    let chunk = match chunk_res {
+                        Ok(c) => c,
+                        Err(e) => {
+                            guard.broadcast_error(SemCacheError::from(e));
+                            return;
+                        }
+                    };
+
+                    if accumulated_bytes.len() + chunk.len() > max_response_bytes {
+                        tracing::warn!(
+                            "Response chunk stream exceeded limit ({} bytes); signaling bypass to followers",
+                            max_response_bytes
+                        );
+                        guard.broadcast_error(SemCacheError::UpstreamOversizedBypass);
+                        return;
+                    }
+                    accumulated_bytes.extend_from_slice(&chunk);
+                }
+
+                let resp_bytes = Bytes::from(accumulated_bytes);
 
                 // 1. Mark state in InFlightMap as Ready(bytes, timestamp) & broadcast to current subscribers
                 guard.mark_ready_and_broadcast(resp_bytes.clone());
 
-                // 2. Persist to SQLite WAL with bounded semaphore backpressure
+                // 2. Persist to SQLite WAL with bounded semaphore backpressure and consecutive failure circuit breaker
                 let model = canonical_val_clone
                     .get("model")
                     .and_then(|m| m.as_str())
@@ -357,21 +463,41 @@ pub async fn handle_chat_completion(
 
                         match write_handle.await {
                             Ok(Ok(())) => {
-                                // SQLite write committed successfully: safe to evict from memory
+                                // SQLite write committed successfully: reset circuit breaker counter and evict
+                                consecutive_write_failures.store(0, Ordering::Relaxed);
                                 guard.evict();
                             }
                             Ok(Err(e)) => {
-                                tracing::warn!("SQLite write failed: {}; retaining entry in Ready RAM cache for TTL", e);
-                                // DO NOT evict immediately; retain in Ready RAM cache so subsequent callers don't duplicate upstream!
+                                dropped_writes_total.fetch_add(1, Ordering::Relaxed);
+                                let failures = consecutive_write_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if failures >= 5 {
+                                    tracing::warn!("SQLite write failure circuit breaker tripped ({} consecutive failures); evicting from Ready RAM", failures);
+                                    guard.evict();
+                                } else {
+                                    tracing::warn!("SQLite write failed: {}; retaining entry in Ready RAM cache (failure {}/5)", e, failures);
+                                }
                             }
                             Err(e) => {
-                                tracing::warn!("SQLite write task error: {}; retaining entry in Ready RAM cache for TTL", e);
+                                dropped_writes_total.fetch_add(1, Ordering::Relaxed);
+                                let failures = consecutive_write_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if failures >= 5 {
+                                    tracing::warn!("SQLite write task failure circuit breaker tripped ({} consecutive failures); evicting from Ready RAM", failures);
+                                    guard.evict();
+                                } else {
+                                    tracing::warn!("SQLite write task error: {}; retaining entry in Ready RAM cache (failure {}/5)", e, failures);
+                                }
                             }
                         }
                     }
                     _ => {
-                        tracing::warn!("SQLite write backpressure saturated; dropping async disk write; retaining entry in Ready RAM cache for TTL");
-                        // DO NOT evict immediately; retain in Ready RAM cache so immediate retries hit RAM!
+                        dropped_writes_total.fetch_add(1, Ordering::Relaxed);
+                        let failures = consecutive_write_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                        if failures >= 5 {
+                            tracing::warn!("SQLite write backpressure circuit breaker tripped ({} consecutive failures); evicting from Ready RAM", failures);
+                            guard.evict();
+                        } else {
+                            tracing::warn!("SQLite write backpressure saturated; retaining entry in Ready RAM cache (failure {}/5)", failures);
+                        }
                     }
                 }
             });
@@ -382,7 +508,12 @@ pub async fn handle_chat_completion(
 
     let resp_bytes = match rx.recv().await {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(err)) => return Err((*err).clone()),
+        Ok(Err(err)) => {
+            if let SemCacheError::UpstreamOversizedBypass = err.as_ref() {
+                return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_OVERSIZED").await;
+            }
+            return Err((*err).clone());
+        }
         Err(_) => {
             return Err(SemCacheError::UpstreamError(
                 502,

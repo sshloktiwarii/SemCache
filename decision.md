@@ -142,6 +142,9 @@ We use **BLAKE3** (`blake3 1.5`) as the primary hashing engine for L1 determinis
 ### Status
 **Superseded by ADR 010** (Replaced with Transparent Non-Blocking Streaming Bypass)
 
+> [!NOTE]
+> **Superseded by ADR 010:** Streaming requests (`stream: true`) are no longer rejected with HTTP 400. In accordance with ADR 010, SemCache transparently proxies SSE streams using a non-blocking dual-stage watchdog (180s TTFB for reasoning models + 30s inter-chunk timeout) with header `x-semcache-status: BYPASS_STREAM`.
+
 ### Context
 OpenAI chat completions support `stream: true` using Server-Sent Events (SSE). Handling streaming responses in an exact/semantic cache gateway requires:
 1. Buffering and re-assembling token chunks into a coherent JSON document for persistence.
@@ -389,43 +392,54 @@ Implement `serialize_canonical_strict` in `src/canonical.rs` to recursively trav
 
 ---
 
-## ADR 016: Multi-Header Credential Salting and Unauthenticated Namespace Isolation
+## ADR 016: Multi-Header Credential Salting, First-Match Precedence, and Authoritative Provider Isolation
 
 ### Status
 **Accepted** (Implemented in Hardening Phase)
 
 ### Context
-AI client libraries use varying authentication headers: `Authorization` (OpenAI), `api-key` (Azure OpenAI), or `x-api-key` (Anthropic/LiteLLM). Furthermore, local LLMs (Ollama, vLLM) often run without authentication. If only `Authorization` is salted, Azure/Anthropic users collapse into `anonymous`, and local LLM users share one unpartitioned cache.
+AI client libraries use varying authentication headers: `Authorization` (OpenAI), `api-key` (Azure OpenAI), or `x-api-key` (Anthropic/LiteLLM). Furthermore, local LLMs (Ollama, vLLM) often run without authentication. If multi-header precedence is undefined, clients sending both `Authorization` and `api-key` (e.g. Azure OpenAI SDKs) could either cause cache collisions or generate silent cache misses across deployments. Additionally, allowing clients to override provider identity via `x-semcache-provider` introduces a Denial-of-Service vector where hostile clients arbitrarily partition the cache.
 
 ### Decision
-1. Salt across all three headers: `Authorization`, `api-key`, and `x-api-key`.
-2. For unauthenticated requests, namespace under a server-configured `SEMCACHE_TENANT_ID` (default `default_tenant`).
-3. Strip all credential headers from stored request JSON in SQLite.
+1. **First-Match Credential Precedence:** The credential salt strictly evaluates headers in the following order:
+   $$\text{Authorization} \succ \text{api-key} \succ \text{x-api-key}$$
+   The first non-empty header encountered is used as the cryptographic salt. If a client transmits both `Authorization` and `api-key`, the cache key is salted exclusively with `Authorization`. This guarantees that Azure deployments do not partition into separate buckets when the SDK includes redundant headers.
+2. **Server-Side Provider Authority:** The client header `x-semcache-provider` is **strictly ignored and removed**. The gateway's `SEMCACHE_DEFAULT_PROVIDER` configuration is authoritative. Clients cannot manipulate the provider cache partition.
+3. **Unauthenticated Isolation:** For unauthenticated requests (e.g. local Ollama or vLLM), requests namespace under `SEMCACHE_TENANT_ID` (default `default_tenant`).
+4. **Zero Credential Leakage:** All credential headers are sanitized from logged and stored request JSON in SQLite.
 
 ### Consequences
 **Positive:**
-- Multi-cloud compatibility across OpenAI, Azure, and Anthropic clients.
-- Isolated namespaces for local LLM clusters.
+- Multi-cloud compatibility across OpenAI, Azure, and Anthropic SDKs with zero cache fragmentation.
+- Prevention of client-driven cache-partitioning DoS attacks.
+- Strict isolation across distinct API keys even when prompts and hyper-parameters are identical.
 - Zero credential leakage into database storage or telemetry.
 
 ---
 
-## ADR 017: Fail-Open SQLite Storage Degradation
+## ADR 017: Fail-Open SQLite Storage Degradation & Write Circuit Breaker
 
 ### Status
 **Accepted** (Implemented in Hardening Phase)
 
 ### Context
-SemCache is an accelerating gateway, not an authoritative datastore. If SQLite encounters disk lock timeouts, table corruption, or I/O failure, failing the client's HTTP request destroys upstream reliability.
+SemCache is an accelerating gateway, not an authoritative datastore. If SQLite encounters disk lock timeouts, table corruption, or I/O failure, failing the client's HTTP request destroys upstream reliability. However, retaining failed writes in RAM `Ready` cache for 10 seconds under continuous disk failure (e.g. disk full, permission denied, WAL corruption) causes RAM usage to grow proportionally to $\text{rate} \times \text{retention}$, risking gateway OOM.
 
 ### Decision
-1. If SQLite L1 read fails, log a warning and degrade gracefully to a cache miss (`None`), continuing to upstream.
-2. If SQLite L1 write fails, log a warning, preserve the response in RAM `Ready` state for 10 seconds, and return the HTTP 200 response to the client.
+1. **L1 Read Fail-Open:** If SQLite L1 read fails, log a warning and degrade gracefully to a cache miss (`None`), continuing upstream without failing the client.
+2. **L1 Write Fail-Open:** If SQLite write fails or times out, log a warning and return the HTTP 200 response to the client.
+3. **Consecutive Write Failure Circuit Breaker:**
+   - Track consecutive write/backpressure failures via an atomic counter.
+   - If consecutive failures are $< 5$, retain the response in RAM `Ready` cache for 10s to serve immediate coalesced retries.
+   - If consecutive failures reach the threshold ($N \ge 5$), trip the circuit breaker: **disable `Ready` RAM retention immediately** and evict the entry upon dispatch. The gateway reverts to pure fail-open, preventing memory accumulation during persistent disk outages.
+   - When any SQLite write succeeds, the failure counter resets to 0.
+4. **Dropped Writes Observability:** Track all dropped and failed writes via `semcache_dropped_writes_total`.
 
 ### Consequences
 **Positive:**
 - Upstream proxy availability is preserved even under catastrophic database failure.
-- Temporary storage degradation does not cause 500 errors to client applications.
+- RAM exhaustion is mathematically prevented during persistent disk outages via the $N=5$ circuit breaker.
+- Full observability of disk write saturation.
 
 ---
 
@@ -435,18 +449,26 @@ SemCache is an accelerating gateway, not an authoritative datastore. If SQLite e
 **Accepted** (Implemented in Hardening Phase)
 
 ### Context
-Unbounded request bodies, multi-hundred-megabyte responses, and unconstrained upstream dispatches expose the gateway to Out-Of-Memory (OOM) crashes and threadpool starvation.
+Unbounded request bodies, multi-hundred-megabyte responses, and unconstrained upstream dispatches expose the gateway to Out-Of-Memory (OOM) crashes and threadpool starvation. Multimodal vision models also require accommodating multi-megabyte inline base64 images without triggering HTTP 413.
 
 ### Decision
-1. Enforce `SEMCACHE_MAX_REQUEST_BYTES` (default 10 MB); reject oversized requests with HTTP 413.
-2. Enforce `SEMCACHE_MAX_RESPONSE_BYTES` (default 10 MB); oversized responses bypass in-memory caching and stream directly.
-3. Gate upstream dispatch behind `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` semaphore (default 256).
-4. Run periodic background sweeps in `RequestCoalescer` every 10 seconds to purge expired `Ready` entries.
-5. Default server binding to `127.0.0.1:3000` to prevent accidental network exposure.
+1. **Request Body Cap (32MB):** Default `SEMCACHE_MAX_REQUEST_BYTES` to 32MB (`32 * 1024 * 1024`) to natively support multimodal vision models (GPT-4o, Claude 3.5 Sonnet, Gemini 1.5 Pro) with inline base64 image attachments. Oversized requests return HTTP 413 Payload Too Large.
+2. **Streaming Response Size Enforcement:** Inspect `Content-Length` and accumulate chunks while streaming upstream bytes. If a response exceeds `SEMCACHE_MAX_RESPONSE_BYTES` (default 10MB), immediately terminate buffering for cache storage. The leader streams to its client, and waiting followers receive an `UpstreamOversizedBypass` directive to fetch directly from upstream with HTTP 200 and header `x-semcache-status: BYPASS_OVERSIZED`.
+3. **Bounded Ready RAM Retention:** Enforce `SEMCACHE_MAX_READY_BYTES` (default 128MB). If adding an entry to `InFlightMap` exceeds the budget, the entry is broadcast to active subscribers and immediately evicted from RAM.
+4. **Upstream Semaphore Exhaustion Contract:** Gate upstream dispatch behind `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` (default 256). When all permits are saturated:
+   - Wait up to 5 seconds.
+   - If timeout expires, return **HTTP 503 Service Unavailable** with **`Retry-After: 5`** header to both the primary worker and all waiting followers.
+   - Increment `semcache_upstream_shed_total`.
+   - L1 cache hits are checked before semaphore acquisition, guaranteeing that cache hits never block on or consume upstream concurrency permits.
+5. **Standard `Cache-Control: no-store` Bypass:** When a request presents `Cache-Control: no-store` or `x-semcache-no-store: true`, bypass L1 cache lookup and persistence, streaming directly from upstream with header `x-semcache-status: BYPASS_NO_STORE`.
+6. **Data at Rest Protection:** Automatically enforce Unix file permissions `0600` on the SQLite database file on startup.
+7. **Secure Loopback Default:** Default server binding to `127.0.0.1:3000`. For containerized deployments, document mandatory `SEMCACHE_BIND=0.0.0.0:3000` with instructions to front the gateway with a secure reverse proxy (Nginx, Envoy, Cloudflare).
 
 ### Consequences
 **Positive:**
-- Strictly bounded memory footprint and threadpool allocation.
-- Protection against denial-of-service via huge payloads.
+- Comprehensive protection against memory exhaustion (streaming response check + 128MB Ready cap).
+- Concurrency exhaustion fails fast with standard HTTP 503 + `Retry-After: 5` semantics.
+- Seamless support for heavy multimodal vision prompts.
+- Full support for client-controlled bypass (`Cache-Control: no-store`).
 
 
