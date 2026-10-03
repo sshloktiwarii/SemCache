@@ -36,25 +36,47 @@ pub struct AppState {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub cancel_orphan_requests: bool,
+    pub deterministic_only: bool,
+    pub credential_headers: Vec<String>,
+    // Observability and Telemetry counters
+    pub requests_total: Arc<AtomicU64>,
+    pub l1_hits_total: Arc<AtomicU64>,
+    pub coalesced_hits_total: Arc<AtomicU64>,
+    pub upstream_fetches_total: Arc<AtomicU64>,
+    pub streaming_bypasses_total: Arc<AtomicU64>,
+    pub oversized_bypasses_total: Arc<AtomicU64>,
+    pub stochastic_bypasses_total: Arc<AtomicU64>,
     pub upstream_shed_total: Arc<AtomicU64>,
     pub dropped_writes_total: Arc<AtomicU64>,
     pub consecutive_write_failures: Arc<AtomicUsize>,
 }
 
-/// A stream wrapper that enforces a dual-stage timeout:
+/// A stream wrapper that enforces a dual-stage timeout and holds an upstream concurrency permit.
 /// 1. Long Time-To-First-Byte (TTFB) timeout (e.g. 180s) to accommodate reasoning models
 ///    (such as `o1-preview` or `o3-mini`) that think silently for 60-120 seconds before emitting token 1.
 /// 2. Shorter inter-chunk watchdog timeout (e.g. 30s) once chunk streaming has commenced.
+/// 3. Retains `_permit` until the stream concludes OR the client disconnects/aborts mid-stream,
+///    preventing permit leaks while bounding active upstream streaming concurrency.
 pub struct IdleTimeoutStream<S> {
     inner: S,
     ttfb_timeout: Duration,
     inter_chunk_timeout: Duration,
     has_received_first_chunk: bool,
     sleep: Pin<Box<Sleep>>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl<S> IdleTimeoutStream<S> {
     pub fn new(inner: S, ttfb_timeout: Duration, inter_chunk_timeout: Duration) -> Self {
+        Self::with_permit(inner, ttfb_timeout, inter_chunk_timeout, None)
+    }
+
+    pub fn with_permit(
+        inner: S,
+        ttfb_timeout: Duration,
+        inter_chunk_timeout: Duration,
+        permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
         let sleep = Box::pin(sleep_until(Instant::now() + ttfb_timeout));
         Self {
             inner,
@@ -62,6 +84,7 @@ impl<S> IdleTimeoutStream<S> {
             inter_chunk_timeout,
             has_received_first_chunk: false,
             sleep,
+            _permit: permit,
         }
     }
 }
@@ -110,6 +133,67 @@ where
     }
 }
 
+/// Extracts a canonical multi-header credential salt.
+///
+/// Salting every credential header present prevents cross-tenant collision
+/// when callers share a gateway Authorization token but differ in per-user api-key headers.
+/// Headers are canonically sorted by lowercase name:
+/// `api-key=val1;authorization=val2;x-api-key=val3;x-goog-api-key=val4`
+pub fn extract_credential_salt(
+    headers: &HeaderMap,
+    credential_headers: &[String],
+    default_tenant_id: &str,
+) -> String {
+    let mut present_credentials = Vec::new();
+
+    for header_name in credential_headers {
+        let name_lower = header_name.to_ascii_lowercase();
+        if let Ok(name) = axum::http::HeaderName::from_bytes(name_lower.as_bytes()) {
+            let mut vals: Vec<&str> = headers
+                .get_all(&name)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !vals.is_empty() {
+                vals.sort_unstable();
+                let joined = vals.join(",");
+                present_credentials.push((name_lower, joined));
+            }
+        }
+    }
+
+    if present_credentials.is_empty() {
+        return default_tenant_id.to_string();
+    }
+
+    present_credentials.sort_by(|a, b| a.0.cmp(&b.0));
+    present_credentials
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Evaluates whether an LLM request payload is deterministic.
+///
+/// A request is considered deterministic if an explicit `seed` parameter is provided,
+/// or if `temperature` is explicitly set to `0.0`.
+pub fn is_payload_deterministic(payload: &Value) -> bool {
+    if let Value::Object(map) = payload {
+        if map.contains_key("seed") {
+            return true;
+        }
+        if let Some(temp) = map.get("temperature").and_then(|v| v.as_f64()) {
+            if temp.abs() < f64::EPSILON {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Health and readiness probe handler.
 pub async fn handle_healthz() -> impl IntoResponse {
     (
@@ -118,6 +202,86 @@ pub async fn handle_healthz() -> impl IntoResponse {
             (header::CONTENT_TYPE, "application/json"),
         ],
         "{\"status\":\"ok\",\"service\":\"semcache\"}",
+    )
+}
+
+/// Renders Prometheus-compatible metrics for SemCache.
+pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let requests = state.requests_total.load(Ordering::Relaxed);
+    let l1_hits = state.l1_hits_total.load(Ordering::Relaxed);
+    let coalesced_hits = state.coalesced_hits_total.load(Ordering::Relaxed);
+    let upstream_fetches = state.upstream_fetches_total.load(Ordering::Relaxed);
+    let streaming_bypasses = state.streaming_bypasses_total.load(Ordering::Relaxed);
+    let oversized_bypasses = state.oversized_bypasses_total.load(Ordering::Relaxed);
+    let stochastic_bypasses = state.stochastic_bypasses_total.load(Ordering::Relaxed);
+    let upstream_shed = state.upstream_shed_total.load(Ordering::Relaxed);
+    let dropped_writes = state.dropped_writes_total.load(Ordering::Relaxed);
+    let write_failures = state.consecutive_write_failures.load(Ordering::Relaxed);
+    let circuit_breaker_open = if write_failures >= 5 { 1 } else { 0 };
+    let ready_bytes = state.coalescer.ready_bytes();
+    let in_flight = state.coalescer.in_flight_count();
+
+    let metrics_text = format!(
+        "# HELP semcache_requests_total Total number of chat completion requests received\n\
+         # TYPE semcache_requests_total counter\n\
+         semcache_requests_total {}\n\n\
+         # HELP semcache_l1_hits_total Total L1 exact cache hits served from SQLite\n\
+         # TYPE semcache_l1_hits_total counter\n\
+         semcache_l1_hits_total {}\n\n\
+         # HELP semcache_coalesced_hits_total Total follower requests coalesced onto in-flight leader\n\
+         # TYPE semcache_coalesced_hits_total counter\n\
+         semcache_coalesced_hits_total {}\n\n\
+         # HELP semcache_upstream_fetches_total Total requests dispatched upstream to provider\n\
+         # TYPE semcache_upstream_fetches_total counter\n\
+         semcache_upstream_fetches_total {}\n\n\
+         # HELP semcache_streaming_bypasses_total Total requests bypassed due to stream=true\n\
+         # TYPE semcache_streaming_bypasses_total counter\n\
+         semcache_streaming_bypasses_total {}\n\n\
+         # HELP semcache_oversized_bypasses_total Total requests bypassed due to response size limit\n\
+         # TYPE semcache_oversized_bypasses_total counter\n\
+         semcache_oversized_bypasses_total {}\n\n\
+         # HELP semcache_stochastic_bypasses_total Total requests bypassed due to deterministic-only replay policy\n\
+         # TYPE semcache_stochastic_bypasses_total counter\n\
+         semcache_stochastic_bypasses_total {}\n\n\
+         # HELP semcache_upstream_shed_total Total requests shed due to upstream semaphore saturation (503)\n\
+         # TYPE semcache_upstream_shed_total counter\n\
+         semcache_upstream_shed_total {}\n\n\
+         # HELP semcache_dropped_writes_total Total SQLite writes dropped due to disk backpressure\n\
+         # TYPE semcache_dropped_writes_total counter\n\
+         semcache_dropped_writes_total {}\n\n\
+         # HELP semcache_consecutive_write_failures Current consecutive SQLite disk write failures\n\
+         # TYPE semcache_consecutive_write_failures gauge\n\
+         semcache_consecutive_write_failures {}\n\n\
+         # HELP semcache_circuit_breaker_open Whether the disk write circuit breaker is currently open (1) or closed (0)\n\
+         # TYPE semcache_circuit_breaker_open gauge\n\
+         semcache_circuit_breaker_open {}\n\n\
+         # HELP semcache_ready_bytes Current bytes held in-memory across Ready states\n\
+         # TYPE semcache_ready_bytes gauge\n\
+         semcache_ready_bytes {}\n\n\
+         # HELP semcache_in_flight_requests Current active in-flight requests in coalescer\n\
+         # TYPE semcache_in_flight_requests gauge\n\
+         semcache_in_flight_requests {}\n",
+        requests,
+        l1_hits,
+        coalesced_hits,
+        upstream_fetches,
+        streaming_bypasses,
+        oversized_bypasses,
+        stochastic_bypasses,
+        upstream_shed,
+        dropped_writes,
+        write_failures,
+        circuit_breaker_open,
+        ready_bytes,
+        in_flight,
+    );
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8"),
+        ],
+        metrics_text,
     )
 }
 
@@ -148,14 +312,11 @@ pub async fn forward_direct_upstream(
         .post(&state.upstream_url)
         .header(header::CONTENT_TYPE, "application/json");
 
-    if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
-        req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
-    }
-    if let Some(key_val) = headers.get("api-key") {
-        req_builder = req_builder.header("api-key", key_val);
-    }
-    if let Some(x_key_val) = headers.get("x-api-key") {
-        req_builder = req_builder.header("x-api-key", x_key_val);
+    for (k, v) in headers.iter() {
+        let name = k.as_str().to_ascii_lowercase();
+        if state.credential_headers.iter().any(|ch| ch == &name) {
+            req_builder = req_builder.header(k, v);
+        }
     }
 
     let upstream_resp = req_builder.body(payload_bytes).send().await?;
@@ -179,6 +340,7 @@ pub async fn forward_direct_upstream(
         .into_response())
 }
 
+
 /// Core HTTP proxy gateway handler for LLM chat completions.
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
@@ -186,6 +348,9 @@ pub async fn handle_chat_completion(
     Json(payload): Json<Value>,
 ) -> Result<Response, SemCacheError> {
     let payload_bytes = serde_json::to_vec(&payload)?;
+
+    // Increment total request counter
+    state.requests_total.fetch_add(1, Ordering::Relaxed);
 
     // Enforce maximum inbound request body size (32MB default for multimodal vision payloads)
     if payload_bytes.len() > state.max_request_bytes {
@@ -212,26 +377,27 @@ pub async fn handle_chat_completion(
         return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_NO_STORE").await;
     }
 
-    // Salt across credential headers with First-Match Precedence (Authorization > api-key > x-api-key).
-    // If no credential header is provided, namespace under server default tenant ID.
-    let auth_str = headers
-        .get(header::AUTHORIZATION)
-        .or_else(|| headers.get("api-key"))
-        .or_else(|| headers.get("x-api-key"))
-        .and_then(|h| h.to_str().ok());
+    // Deterministic-only replay policy bypass
+    if state.deterministic_only && !is_payload_deterministic(&payload) {
+        state.stochastic_bypasses_total.fetch_add(1, Ordering::Relaxed);
+        return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_STOCHASTIC").await;
+    }
 
-    let tenant_salt = auth_str.unwrap_or(&state.default_tenant_id);
+    // Salt across all credential headers present to guarantee strict tenant isolation.
+    // Callers who share an Authorization value but differ in api-key will NOT collide.
+    let tenant_salt = extract_credential_salt(&headers, &state.credential_headers, &state.default_tenant_id);
 
     // Server-side provider configuration is authoritative (eliminating client header spoofing)
     let provider = state.default_provider;
 
-    let canonical_res = canonicalize_and_hash(&payload_bytes, Some(tenant_salt), provider)?;
+    let canonical_res = canonicalize_and_hash(&payload_bytes, Some(&tenant_salt), provider)?;
     let hash = canonical_res.hash;
     let canonical_val = canonical_res.canonical_value;
 
-    // Step 1: Non-Blocking Streaming Bypass with Dual-Stage TTFB/Inter-Chunk Timeout
+    // Step 1: Non-Blocking Streaming Bypass with Dual-Stage TTFB/Inter-Chunk Timeout & Permit Retention
     if canonical_res.is_streaming {
-        let _upstream_permit = match tokio::time::timeout(
+        state.streaming_bypasses_total.fetch_add(1, Ordering::Relaxed);
+        let upstream_permit = match tokio::time::timeout(
             Duration::from_secs(5),
             state.upstream_semaphore.clone().acquire_owned(),
         )
@@ -248,14 +414,11 @@ pub async fn handle_chat_completion(
             .post(&state.upstream_url)
             .header(header::CONTENT_TYPE, "application/json");
 
-        if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
-            req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
-        }
-        if let Some(key_val) = headers.get("api-key") {
-            req_builder = req_builder.header("api-key", key_val);
-        }
-        if let Some(x_key_val) = headers.get("x-api-key") {
-            req_builder = req_builder.header("x-api-key", x_key_val);
+        for (k, v) in headers.iter() {
+            let name = k.as_str().to_ascii_lowercase();
+            if state.credential_headers.iter().any(|ch| ch == &name) {
+                req_builder = req_builder.header(k, v);
+            }
         }
 
         let upstream_resp = req_builder.body(payload_bytes).send().await?;
@@ -267,10 +430,11 @@ pub async fn handle_chat_completion(
             return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
         }
 
-        let idle_stream = IdleTimeoutStream::new(
+        let idle_stream = IdleTimeoutStream::with_permit(
             upstream_resp.bytes_stream(),
             Duration::from_secs(180),
             Duration::from_secs(30),
+            Some(upstream_permit),
         );
         let stream_body = Body::from_stream(idle_stream);
         return Response::builder()
@@ -297,6 +461,7 @@ pub async fn handle_chat_completion(
     };
 
     if let Some(cached_json) = l1_hit {
+        state.l1_hits_total.fetch_add(1, Ordering::Relaxed);
         return Ok((
             StatusCode::OK,
             [
@@ -309,8 +474,9 @@ pub async fn handle_chat_completion(
     }
 
     // Step 3: Single-Flight Request Coalescing
-    let (mut rx, is_leader) = match state.coalescer.register_or_wait(hash).await? {
-        CoalesceResult::Coalesced(coalesced_bytes) => {
+    let (mut rx, is_leader) = match state.coalescer.register_or_wait(hash).await {
+        Ok(CoalesceResult::Coalesced(coalesced_bytes)) => {
+            state.coalesced_hits_total.fetch_add(1, Ordering::Relaxed);
             return Ok((
                 StatusCode::OK,
                 [
@@ -321,13 +487,18 @@ pub async fn handle_chat_completion(
             )
                 .into_response());
         }
-        CoalesceResult::Primary(mut guard, leader_rx) => {
+        Ok(CoalesceResult::Primary(mut guard, leader_rx)) => {
+            state.upstream_fetches_total.fetch_add(1, Ordering::Relaxed);
             let http_client = state.http_client.clone();
             let upstream_url = state.upstream_url.clone();
             let db_pool = state.db.clone();
-            let auth_header_opt = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).map(|s| s.to_string());
-            let api_key_opt = headers.get("api-key").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
-            let x_api_key_opt = headers.get("x-api-key").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+            let mut forwarded_headers: Vec<(header::HeaderName, header::HeaderValue)> = Vec::new();
+            for (k, v) in headers.iter() {
+                let name = k.as_str().to_ascii_lowercase();
+                if state.credential_headers.iter().any(|ch| ch == &name) {
+                    forwarded_headers.push((k.clone(), v.clone()));
+                }
+            }
             let payload_bytes_clone = payload_bytes.clone();
             let canonical_val_clone = canonical_val.clone();
             let write_semaphore = state.sqlite_write_semaphore.clone();
@@ -367,14 +538,8 @@ pub async fn handle_chat_completion(
                     .post(&upstream_url)
                     .header(header::CONTENT_TYPE, "application/json");
 
-                if let Some(auth_val) = auth_header_opt {
-                    req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
-                }
-                if let Some(key_val) = api_key_opt {
-                    req_builder = req_builder.header("api-key", key_val);
-                }
-                if let Some(x_key_val) = x_api_key_opt {
-                    req_builder = req_builder.header("x-api-key", x_key_val);
+                for (k, v) in forwarded_headers {
+                    req_builder = req_builder.header(k, v);
                 }
 
                 let upstream_resp = match req_builder.body(payload_bytes_clone).send().await {
@@ -463,7 +628,7 @@ pub async fn handle_chat_completion(
 
                         match write_handle.await {
                             Ok(Ok(())) => {
-                                // SQLite write committed successfully: reset circuit breaker counter and evict
+                                // SQLite write committed successfully: reset circuit breaker counter and evict from Ready RAM
                                 consecutive_write_failures.store(0, Ordering::Relaxed);
                                 guard.evict();
                             }
@@ -490,26 +655,29 @@ pub async fn handle_chat_completion(
                         }
                     }
                     _ => {
+                        // Queue backpressure / timeout acquiring write permit under load.
+                        // CRITICAL: Do NOT increment consecutive_write_failures here!
+                        // Saturated write semaphore during a burst on a healthy disk must not trip the circuit breaker.
                         dropped_writes_total.fetch_add(1, Ordering::Relaxed);
-                        let failures = consecutive_write_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                        if failures >= 5 {
-                            tracing::warn!("SQLite write backpressure circuit breaker tripped ({} consecutive failures); evicting from Ready RAM", failures);
-                            guard.evict();
-                        } else {
-                            tracing::warn!("SQLite write backpressure saturated; retaining entry in Ready RAM cache (failure {}/5)", failures);
-                        }
+                        tracing::warn!("SQLite write backpressure saturated; dropping async disk write while retaining entry in Ready RAM cache");
                     }
                 }
             });
 
             (leader_rx, true)
         }
+        Err(SemCacheError::UpstreamOversizedBypass) => {
+            state.oversized_bypasses_total.fetch_add(1, Ordering::Relaxed);
+            return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_OVERSIZED").await;
+        }
+        Err(e) => return Err(e),
     };
 
     let resp_bytes = match rx.recv().await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(err)) => {
             if let SemCacheError::UpstreamOversizedBypass = err.as_ref() {
+                state.oversized_bypasses_total.fetch_add(1, Ordering::Relaxed);
                 return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_OVERSIZED").await;
             }
             return Err((*err).clone());
@@ -538,3 +706,4 @@ pub async fn handle_chat_completion(
     )
         .into_response())
 }
+

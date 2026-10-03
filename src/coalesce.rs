@@ -152,6 +152,10 @@ impl RequestCoalescer {
         self.ready_bytes_total.load(Ordering::Relaxed)
     }
 
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
     /// Atomically checks if an in-flight request exists for `hash`.
     /// - If Ready(bytes, timestamp) is present:
     ///   If fresh (< 10s), returns immediately from memory.

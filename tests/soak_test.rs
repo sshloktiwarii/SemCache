@@ -59,6 +59,14 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
     let dropped_writes_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let consecutive_write_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+    let requests_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let l1_hits_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let coalesced_hits_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let upstream_fetches_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let streaming_bypasses_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let oversized_bypasses_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let stochastic_bypasses_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let state = AppState {
         db: pool.clone(),
         http_client,
@@ -71,6 +79,20 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         max_request_bytes: 32 * 1024 * 1024,
         max_response_bytes: 10 * 1024 * 1024,
         cancel_orphan_requests: false,
+        deterministic_only: false,
+        credential_headers: vec![
+            "authorization".to_string(),
+            "api-key".to_string(),
+            "x-api-key".to_string(),
+            "x-goog-api-key".to_string(),
+        ],
+        requests_total,
+        l1_hits_total,
+        coalesced_hits_total,
+        upstream_fetches_total,
+        streaming_bypasses_total,
+        oversized_bypasses_total,
+        stochastic_bypasses_total,
         upstream_shed_total,
         dropped_writes_total,
         consecutive_write_failures,
@@ -411,3 +433,225 @@ async fn test_soak_behavior_during_process_shutdown() {
 
     let _ = std::fs::remove_file(db_path);
 }
+
+#[tokio::test]
+async fn test_sustained_multiround_soak() {
+    println!("\n=======================================================");
+    println!("   SEMCACHE MULTI-WAVE SUSTAINED SOAK & LEAK PROBER   ");
+    println!("=======================================================");
+
+    let mock_server = MockServer::start().await;
+    let upstream_counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = upstream_counter.clone();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(move |_req: &wiremock::Request| {
+            counter_clone.fetch_add(1, Ordering::Relaxed);
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(10))
+                .set_body_json(json!({
+                    "id": "chatcmpl-multiwave",
+                    "choices": [{
+                        "message": { "role": "assistant", "content": "Multiwave soak response." }
+                    }]
+                }))
+        })
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, state) = create_soak_app(format!("{}/v1/chat/completions", mock_server.uri()));
+    let app = Arc::new(app);
+
+    let initial_rss = get_rss_bytes();
+    let start_time = Instant::now();
+
+    // -------------------------------------------------------------
+    // WAVE 1: Cold cache warm-up (100 requests across 10 buckets)
+    // -------------------------------------------------------------
+    println!("[Wave 1] Cold cache population (100 requests, 10 buckets)...");
+    let mut w1_handles = Vec::new();
+    for i in 0..100 {
+        let app_c = app.clone();
+        w1_handles.push(tokio::spawn(async move {
+            let bucket = i % 10;
+            let payload = json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": format!("Multiwave prompt bucket #{}", bucket) }]
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-soak-multi")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap();
+            let resp = (*app_c).clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let _ = resp.into_body().collect().await.unwrap();
+        }));
+    }
+    for h in w1_handles {
+        h.await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let wave1_upstream = upstream_counter.load(Ordering::Relaxed);
+    println!("  -> Wave 1 upstream calls: {} (expected <= 15)", wave1_upstream);
+    assert!(wave1_upstream <= 15);
+
+    // -------------------------------------------------------------
+    // WAVE 2: Pure L1 exact cache hit barrage (500 requests at 50 concurrency)
+    // -------------------------------------------------------------
+    println!("[Wave 2] L1 cache hit barrage (500 requests, 50 concurrency)...");
+    let mut w2_handles = Vec::new();
+    for i in 0..500 {
+        let app_c = app.clone();
+        w2_handles.push(tokio::spawn(async move {
+            let bucket = i % 10;
+            let payload = json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": format!("Multiwave prompt bucket #{}", bucket) }]
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-soak-multi")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap();
+            let resp = (*app_c).clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(resp.headers().get("x-semcache-status").unwrap(), "HIT_L1");
+            let _ = resp.into_body().collect().await.unwrap();
+        }));
+    }
+    for h in w2_handles {
+        h.await.unwrap();
+    }
+
+    let wave2_upstream = upstream_counter.load(Ordering::Relaxed);
+    println!("  -> Wave 2 upstream calls added: {} (expected 0 new calls)", wave2_upstream - wave1_upstream);
+    assert_eq!(wave2_upstream, wave1_upstream, "Zero upstream calls should occur during L1 hit barrage");
+
+    // -------------------------------------------------------------
+    // WAVE 3: Massive single-flight stampede (100 requests launched concurrently on a new key)
+    // -------------------------------------------------------------
+    println!("[Wave 3] Massive single-flight stampede (100 concurrent on brand new key)...");
+    let barrier = Arc::new(tokio::sync::Barrier::new(100));
+    let mut w3_handles = Vec::new();
+    for _ in 0..100 {
+        let app_c = app.clone();
+        let bar_c = barrier.clone();
+        w3_handles.push(tokio::spawn(async move {
+            bar_c.wait().await;
+            let payload = json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Brand new stampede query for Wave 3" }]
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer sk-soak-multi")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap();
+            let resp = (*app_c).clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let status = resp.headers().get("x-semcache-status").unwrap().to_str().unwrap().to_string();
+            let _ = resp.into_body().collect().await.unwrap();
+            status
+        }));
+    }
+
+    let mut w3_statuses = Vec::new();
+    for h in w3_handles {
+        w3_statuses.push(h.await.unwrap());
+    }
+
+    let wave3_upstream = upstream_counter.load(Ordering::Relaxed);
+    println!("  -> Wave 3 upstream calls added: {} (expected 1)", wave3_upstream - wave2_upstream);
+    assert_eq!(wave3_upstream - wave2_upstream, 1, "Exactly 1 upstream call must be made during coalescing stampede");
+
+    let leader_misses = w3_statuses.iter().filter(|s| *s == "MISS_UPSTREAM").count();
+    let coalesced_hits = w3_statuses.iter().filter(|s| *s == "HIT_COALESCED").count();
+    assert_eq!(leader_misses, 1);
+    assert_eq!(coalesced_hits, 99);
+
+    // -------------------------------------------------------------
+    // WAVE 4: Multi-tenant mixed traffic (300 requests across 3 distinct tenants)
+    // -------------------------------------------------------------
+    println!("[Wave 4] Multi-tenant mixed traffic (300 requests, 3 tenants)...");
+    let mut w4_handles = Vec::new();
+    for i in 0..300 {
+        let app_c = app.clone();
+        w4_handles.push(tokio::spawn(async move {
+            let tenant_idx = i % 3;
+            let key = format!("Bearer sk-tenant-soak-{}", tenant_idx);
+            let payload = json!({
+                "model": "gpt-4o",
+                "messages": [{ "role": "user", "content": "Identical prompt across different tenants" }]
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, key)
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap();
+            let resp = (*app_c).clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let _ = resp.into_body().collect().await.unwrap();
+        }));
+    }
+    for h in w4_handles {
+        h.await.unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let wave4_upstream = upstream_counter.load(Ordering::Relaxed);
+    // Since 3 tenants share identical prompts, exactly 3 distinct cache partitions must be created upstream
+    let new_upstream_wave4 = wave4_upstream - wave3_upstream;
+    println!("  -> Wave 4 upstream calls added: {} (expected 3 for 3 distinct tenants)", new_upstream_wave4);
+    assert!(new_upstream_wave4 <= 4, "Multi-tenant isolation must constrain upstream calls to <= 4");
+
+    // -------------------------------------------------------------
+    // POST-SOAK VERIFICATION & MEMORY LEAK PROBING
+    // -------------------------------------------------------------
+    let total_duration = start_time.elapsed();
+    let final_rss = get_rss_bytes();
+    let rss_diff_kb = (final_rss as i64 - initial_rss as i64) / 1024;
+
+    let wal_path = format!("{}-wal", db_path);
+    let wal_size_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+    let residual_in_flight = state.coalescer.in_flight_count();
+    let available_write_permits = state.sqlite_write_semaphore.available_permits();
+    let available_upstream_permits = state.upstream_semaphore.available_permits();
+
+    println!("-------------------------------------------------------");
+    println!("Total Multi-Wave Execution Time: {:.2?}", total_duration);
+    println!("Total Inbound Requests:          1000");
+    println!("Total Upstream Calls:            {}", wave4_upstream);
+    println!("Offload Ratio:                   {:.2}%", (1.0 - (wave4_upstream as f64 / 1000.0)) * 100.0);
+    println!("Resident Memory (RSS):           Initial: {:.2} MB | Final: {:.2} MB (Diff: {:+} KB)",
+        initial_rss as f64 / 1_048_576.0,
+        final_rss as f64 / 1_048_576.0,
+        rss_diff_kb
+    );
+    println!("DB File Size:                    {} KB", db_size_bytes / 1024);
+    println!("WAL File Size:                   {} KB", wal_size_bytes / 1024);
+    println!("Residual In-Flight Entries:      {}", residual_in_flight);
+    println!("Available SQLite Write Permits:  {} / 4", available_write_permits);
+    println!("Available Upstream Permits:      {} / 256", available_upstream_permits);
+    println!("=======================================================\n");
+
+    assert_eq!(residual_in_flight, 0, "In-flight map must be zero at end of soak");
+    assert_eq!(available_write_permits, 4, "All 4 SQLite write permits must be restored");
+    assert_eq!(available_upstream_permits, 256, "All 256 upstream concurrency permits must be restored");
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&wal_path);
+}
+

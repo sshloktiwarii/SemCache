@@ -1,4 +1,4 @@
-#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod canonical;
 pub mod coalesce;

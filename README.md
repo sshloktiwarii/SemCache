@@ -88,6 +88,7 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 | `BYPASS_STREAM` | Streaming completion (`stream: true`) forwarded through watchdog proxy. |
 | `BYPASS_NO_STORE`| Request carried `Cache-Control: no-store`; bypassed cache and coalescing. |
 | `BYPASS_OVERSIZED`| Upstream response exceeded response size cap; bypassed cache without error. |
+| `BYPASS_STOCHASTIC`| Deterministic-only replay active; request has temperature > 0 and no seed. |
 
 ---
 
@@ -100,6 +101,9 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 | `OPENAI_UPSTREAM_URL` | `https://api.openai.com/v1/chat/completions` | Target upstream LLM completion endpoint. |
 | `SEMCACHE_DEFAULT_PROVIDER` | `openai` | Authoritative provider profile (`openai`, `ollama`, `generic`). |
 | `SEMCACHE_TENANT_ID` | `default_tenant` | Fallback tenant identifier for unauthenticated endpoints. |
+| `SEMCACHE_DETERMINISTIC_ONLY` | `false` | When true, only caches requests with `temperature == 0.0` or explicit `seed`. |
+| `SEMCACHE_CREDENTIAL_HEADERS` | `authorization,api-key,x-api-key,x-goog-api-key` | Comma-separated list of headers to salt for tenant isolation. |
+| `SEMCACHE_MAX_DB_BYTES` | `10737418240` (10 GB) | Disk storage limit; auto-prunes oldest records and vacuums on overflow. |
 | `SEMCACHE_MAX_REQUEST_BYTES` | `33554432` (32 MB) | Maximum request size (accommodates base64 vision images; HTTP 413). |
 | `SEMCACHE_MAX_RESPONSE_BYTES`| `10485760` (10 MB) | Maximum response size; larger payloads bypass cache via streaming. |
 | `SEMCACHE_MAX_READY_BYTES` | `134217728` (128 MB) | Bounded memory ceiling for in-flight `Ready` responses. |
@@ -142,11 +146,19 @@ SEMCACHE_BIND="127.0.0.1:3000" \
 export OPENAI_BASE_URL="http://127.0.0.1:3000/v1"
 ```
 
-### Health Probe
+### Health & Metrics Probes
 
 ```bash
+# Health check
 curl http://127.0.0.1:3000/healthz
 # {"status":"ok","service":"semcache"}
+
+# Prometheus metrics exposition
+curl http://127.0.0.1:3000/metrics
+# # HELP semcache_requests_total Total number of chat completion requests received
+# # TYPE semcache_requests_total counter
+# semcache_requests_total 42
+# ...
 ```
 
 ---
@@ -154,7 +166,7 @@ curl http://127.0.0.1:3000/healthz
 ## Test Verification Suite
 
 ```bash
-# Run unit and integration tests (44 tests across all suites)
+# Run unit and integration tests (54 tests across all suites)
 cargo test --release
 
 # Run multi-threaded barrier stampede and governance tests
@@ -163,6 +175,7 @@ cargo test --test integration_tests --release
 # Run sustained soak and stress benchmarks
 cargo test --test soak_test --release
 
-# Enforce zero clippy warnings and unwrap denials
+# Enforce zero clippy warnings and unwrap/expect denials
 cargo clippy --all-targets -- -D warnings
 ```
+

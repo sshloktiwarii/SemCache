@@ -5,9 +5,32 @@ use r2d2_sqlite::SqliteConnectionManager;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 
-/// Initializes the SQLite connection pool with enforced WAL mode pragmas
-/// and executes schema migrations.
+/// Initializes the SQLite connection pool with enforced WAL mode pragmas,
+/// strict 0600 permissions, bounded checkout timeout, and executes schema migrations.
 pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
+    #[cfg(unix)]
+    {
+        // Enforce strict umask 0077 immediately so any file created by SQLite or this process
+        // (-wal, -shm, temp files) is owner-only read/write (0600) from the very first system call.
+        unsafe {
+            libc::umask(0o077);
+        }
+
+        // Also pre-create the DB file with 0600 mode if it does not yet exist.
+        if !std::path::Path::new(db_path).exists() {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Some(parent) = std::path::Path::new(db_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(db_path);
+        }
+    }
+
     let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -18,8 +41,14 @@ pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
         )
     });
 
+    let pool_size: u32 = std::env::var("SEMCACHE_DB_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+
     let pool = Pool::builder()
-        .max_size(16)
+        .max_size(pool_size)
+        .connection_timeout(std::time::Duration::from_millis(500))
         .build(manager)
         .map_err(SemCacheError::from)?;
 
@@ -67,13 +96,20 @@ pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
     }
 
     // Enforce strict file permissions (0600) on Unix platforms for data-at-rest protection
+    // across the primary db file, wal file, and shm file.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = std::fs::metadata(db_path) {
-            let mut perms = metadata.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(db_path, perms);
+        for path in &[
+            db_path.to_string(),
+            format!("{}-wal", db_path),
+            format!("{}-shm", db_path),
+        ] {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mut perms = metadata.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(path, perms);
+            }
         }
     }
 
@@ -189,6 +225,69 @@ pub fn prune_expired_records(pool: &DbPool, max_age_days: i64) -> Result<usize, 
     Ok(total_deleted)
 }
 
+/// Queries the SQLite database size in bytes based on page count and page size.
+pub fn get_db_size_bytes(pool: &DbPool) -> Result<u64, SemCacheError> {
+    let conn = pool.get().map_err(SemCacheError::from)?;
+    let page_count: i64 = conn.query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+    Ok((page_count.max(0) as u64) * (page_size.max(0) as u64))
+}
+
+/// Prunes the oldest records in exact_cache and fuzzy_payloads (LRU-by-created_at).
+pub fn prune_oldest_records(pool: &DbPool, count: usize) -> Result<usize, SemCacheError> {
+    let conn = pool.get().map_err(SemCacheError::from)?;
+    let deleted_exact = conn.execute(
+        "DELETE FROM exact_cache WHERE canonical_hash IN (
+            SELECT canonical_hash FROM exact_cache ORDER BY created_at ASC LIMIT ?1
+        )",
+        [count as i64],
+    )?;
+    let deleted_fuzzy = conn.execute(
+        "DELETE FROM fuzzy_payloads WHERE id IN (
+            SELECT id FROM fuzzy_payloads ORDER BY created_at ASC LIMIT ?1
+        )",
+        [count as i64],
+    )?;
+    Ok(deleted_exact + deleted_fuzzy)
+}
+
+/// Enforces the maximum SQLite storage capacity by pruning oldest entries
+/// until the total page size is below `max_bytes`.
+pub fn enforce_max_db_size(pool: &DbPool, max_bytes: u64) -> Result<usize, SemCacheError> {
+    let mut current_bytes = get_db_size_bytes(pool)?;
+    if current_bytes <= max_bytes {
+        return Ok(0);
+    }
+
+    let mut total_deleted = 0;
+    while current_bytes > max_bytes {
+        let deleted = prune_oldest_records(pool, 500)?;
+        if deleted == 0 {
+            break;
+        }
+        total_deleted += deleted;
+        // Truncate wal pages to reclaim disk pages
+        let conn = pool.get().map_err(SemCacheError::from)?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        current_bytes = get_db_size_bytes(pool)?;
+    }
+
+    if total_deleted > 0 {
+        let conn = pool.get().map_err(SemCacheError::from)?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    }
+
+    Ok(total_deleted)
+}
+
+/// Executes a SQLite VACUUM to defragment storage and reduce database file size.
+pub fn vacuum_db(pool: &DbPool) -> Result<(), SemCacheError> {
+    let conn = pool.get().map_err(SemCacheError::from)?;
+    conn.execute_batch("VACUUM;")?;
+    Ok(())
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,4 +358,31 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[test]
+    fn test_storage_cap_pruning_and_vacuum() {
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("semcache_test_cap_{}.db", std::process::id()));
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let pool = init_db_pool(&db_path_str).expect("init db pool");
+
+        // Insert 10 entries
+        for i in 0..10 {
+            let mut hash = [0u8; 32];
+            hash[0] = i as u8;
+            insert_exact_cache(&pool, &hash, "gpt-4o", "{}", "{}").expect("insert");
+        }
+
+        let size = get_db_size_bytes(&pool).expect("get size");
+        assert!(size > 0);
+
+        let pruned = prune_oldest_records(&pool, 5).expect("prune 5");
+        assert_eq!(pruned, 5);
+
+        vacuum_db(&pool).expect("vacuum");
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }
+

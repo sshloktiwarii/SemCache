@@ -422,12 +422,61 @@ In v1.1, memory eviction will be explicitly coupled to the SQLite completion eve
 
 ---
 
-## 10. Verification & Audit Trail
+## 10. Architectural Decision Records (ADRs: 016–022)
+
+### ADR-016: Multi-Header Credential Salting Isolation
+- **Context:** Previous implementations used first-match precedence (`Authorization`, then `api-key`, then `x-api-key`). In API gateway topologies, multiple callers frequently share a gateway `Authorization` bearer token while differing in downstream user `api-key` headers. A first-match precedence collapsed them into the same cache partition, causing cross-tenant cache leakage.
+- **Decision:** Concatenate and sort *all* present credential headers defined in `credential_headers` (defaulting to `authorization`, `api-key`, `x-api-key`, `x-goog-api-key`). The salt format is `k1=v1;k2=v2`. Callers sharing a gateway token but differing in user keys land in strictly isolated cache partitions.
+
+### ADR-017: Circuit Breaker Real-Write Errors & Success Recovery
+- **Context:** Counting write-semaphore saturation (queue timeouts during heavy write bursts) toward the 5 consecutive failure threshold caused the circuit breaker to trip during load spikes on completely healthy disks. Tripping the breaker evicted `Ready` entries from RAM, opening the duplicate-call window during stampedes. Furthermore, once tripped, there was no recovery path to re-close the breaker.
+- **Decision:** Write queue backpressure drops are tracked as `dropped_writes_total` without incrementing `consecutive_write_failures`. Only actual SQLite disk write errors or worker panics increment `consecutive_write_failures`. Any subsequent successful SQLite write immediately resets `consecutive_write_failures` to 0, automatically re-closing the breaker.
+
+### ADR-018: Deterministic-Only Replay Policy (`SEMCACHE_DETERMINISTIC_ONLY`)
+- **Context:** Default LLM requests with `temperature == 1.0` and no seed are stochastic. Caching and replaying them for the full 7-day TTL requires client cooperation (`no-store`).
+- **Decision:** Introduce `SEMCACHE_DETERMINISTIC_ONLY=true`. When enabled, requests are evaluated via `is_payload_deterministic`: only payloads with `temperature == 0.0` or an explicit `seed` are cached and replayed. Stochastic requests bypass cache storage with `x-semcache-status: BYPASS_STOCHASTIC`.
+
+### ADR-019: Storage Capacity Bounding & Vacuum Strategy
+- **Context:** While TTL expiration purges expired records, continuous writes under heavy load without a disk cap can exhaust storage, and SQLite does not automatically reclaim disk space without vacuuming.
+- **Decision:** Introduce `SEMCACHE_MAX_DB_BYTES` (default 10 GB) and background maintenance. When the database size exceeds the threshold, `prune_oldest_records` purges the oldest entries until size drops below 80% of the limit. Periodic incremental or full `VACUUM` is invoked, and reader pool checkout timeout is bounded to 500ms to fail-open under disk stalls.
+
+### ADR-020: Prometheus Metrics Exposition & Background Telemetry
+- **Context:** Production operators require real-time visibility into cache hit rates, upstream shedding, dropped writes, and circuit breaker status.
+- **Decision:** Expose `GET /metrics` returning Prometheus-compatible text exposition format covering:
+  - `semcache_requests_total`
+  - `semcache_l1_hits_total`
+  - `semcache_coalesced_hits_total`
+  - `semcache_upstream_fetches_total`
+  - `semcache_streaming_bypasses_total`
+  - `semcache_oversized_bypasses_total`
+  - `semcache_stochastic_bypasses_total`
+  - `semcache_upstream_shed_total`
+  - `semcache_dropped_writes_total`
+  - `semcache_consecutive_write_failures`
+  - `semcache_circuit_breaker_open`
+  - `semcache_ready_bytes`
+  - `semcache_in_flight_requests`
+  A background task additionally outputs a periodic structured telemetry log line every 30 seconds.
+
+### ADR-021: Stream Concurrency Permit Retention & Mid-Stream Disconnect Cleanup
+- **Context:** Streaming requests bypass coalescing and connect directly upstream. Holding an upstream permit without releasing it on mid-stream client disconnect would permanently exhaust the 256 concurrency permits, causing 503 errors.
+- **Decision:** `IdleTimeoutStream` encapsulates `_permit: Option<OwnedSemaphorePermit>`. The permit is held for the full duration of the SSE stream. If the client disconnects or aborts, Axum drops the response body, which drops `IdleTimeoutStream`, immediately releasing the permit back to the semaphore.
+
+### ADR-022: File Permissions Security Timing
+- **Context:** Setting `chmod 0600` on the database file after SQLite opens it leaves `-wal` and `-shm` temporary files created under the process's default umask (typically 0022 / 0644), exposing prompt logs to other users on multi-user systems.
+- **Decision:** On Unix platforms, `libc::umask(0o077)` is invoked before opening the database pool, and the target database file is pre-created with `0600` permissions. All secondary SQLite files (`-wal`, `-shm`) inherit restricted `0600` mode. Relative paths are resolved to absolute paths before initialization.
+
+---
+
+## 11. Verification & Audit Trail
 
 | Verification Category | Command | Target / SLA | Status |
 | :--- | :--- | :--- | :--- |
-| **Unit & Integration Suite** | `cargo test` | 28/28 tests passing | Verified |
-| **Release Build** | `cargo build --release` | Zero errors | Verified |
-| **Static Linting** | `cargo clippy --all-targets` | Zero warnings | Verified |
-| **Sustained Soak Run** | `cargo test --test soak_test` | $> 4,000\,\text{req/s}$, 99% offload | Verified |
-| **Git & Secret Hygiene** | `git ls-files \| grep -E 'target/\|\.db'` | Zero artifacts tracked | Verified |
+| **Unit Suite** | `cargo test --lib` | 23/23 tests passing | Verified |
+| **Integration Suite** | `cargo test --test integration_tests` | 26/26 tests passing | Verified |
+| **Soak & Benchmark Suite** | `cargo test --test soak_test` | 5/5 tests passing ($> 4,400\,\text{req/s}$, 99% offload) | Verified |
+| **Total Test Suite** | `cargo test` | 54/54 tests passing | Verified |
+| **Static Linting & Denial** | `cargo clippy --all-targets -- -D warnings` | Zero warnings; `#![deny(clippy::unwrap_used, clippy::expect_used)]` | Verified |
+| **Full History Secrets Audit** | `git grep "sk-" $(git rev-list --all)` | Zero production keys/secrets committed across entire git history | Verified |
+| **File Permissions** | `stat -f "%OLp" semcache.db*` | Exactly `0600` on `.db`, `-wal`, `-shm` | Verified |
+

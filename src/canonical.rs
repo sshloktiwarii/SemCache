@@ -371,6 +371,21 @@ mod tests {
     }
 
     #[test]
+    fn test_multi_header_credential_salting_isolation() {
+        let payload = br#"{"model":"gpt-4o","prompt":"Hello shared gateway"}"#;
+
+        // Two callers who share an Authorization value but differ in api-key
+        let salt_caller_a = "api-key=alice;authorization=Bearer shared-gateway";
+        let salt_caller_b = "api-key=bob;authorization=Bearer shared-gateway";
+
+        let res_a = canonicalize_and_hash(payload, Some(salt_caller_a), Provider::OpenAi).unwrap();
+        let res_b = canonicalize_and_hash(payload, Some(salt_caller_b), Provider::OpenAi).unwrap();
+
+        assert_ne!(res_a.hash, res_b.hash);
+    }
+
+
+    #[test]
     fn test_azure_openai_url_detection() {
         assert_eq!(
             Provider::from_hint(None, "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions"),
