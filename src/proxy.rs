@@ -8,12 +8,14 @@ use futures_util::Stream;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tokio::time::{sleep_until, Instant, Sleep};
 
 use crate::{
-    canonical::canonicalize_and_hash,
+    canonical::{canonicalize_and_hash, Provider},
     coalesce::{CoalesceResult, RequestCoalescer},
     db::{get_exact_cache, insert_exact_cache, DbPool},
     error::SemCacheError,
@@ -25,26 +27,29 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub coalescer: RequestCoalescer,
     pub upstream_url: String,
+    pub sqlite_write_semaphore: Arc<Semaphore>,
 }
 
-/// A stream wrapper that enforces an idle timeout between consecutive chunks.
-///
-/// CRITICAL FIX (The Guillotine Eradication):
-/// As long as chunks are actively received within `timeout_duration`, the stream
-/// can run indefinitely (supporting reasoning models and multi-megabyte code streams).
-/// If the upstream goes silent for `timeout_duration`, the stream terminates cleanly.
+/// A stream wrapper that enforces a dual-stage timeout:
+/// 1. Long Time-To-First-Byte (TTFB) timeout (e.g. 180s) to accommodate reasoning models
+///    (such as `o1-preview` or `o3-mini`) that think silently for 60-120 seconds before emitting token 1.
+/// 2. Shorter inter-chunk watchdog timeout (e.g. 30s) once chunk streaming has commenced.
 pub struct IdleTimeoutStream<S> {
     inner: S,
-    timeout_duration: Duration,
+    ttfb_timeout: Duration,
+    inter_chunk_timeout: Duration,
+    has_received_first_chunk: bool,
     sleep: Pin<Box<Sleep>>,
 }
 
 impl<S> IdleTimeoutStream<S> {
-    pub fn new(inner: S, timeout_duration: Duration) -> Self {
-        let sleep = Box::pin(sleep_until(Instant::now() + timeout_duration));
+    pub fn new(inner: S, ttfb_timeout: Duration, inter_chunk_timeout: Duration) -> Self {
+        let sleep = Box::pin(sleep_until(Instant::now() + ttfb_timeout));
         Self {
             inner,
-            timeout_duration,
+            ttfb_timeout,
+            inter_chunk_timeout,
+            has_received_first_chunk: false,
             sleep,
         }
     }
@@ -60,7 +65,8 @@ where
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(item))) => {
-                let new_deadline = Instant::now() + self.timeout_duration;
+                self.has_received_first_chunk = true;
+                let new_deadline = Instant::now() + self.inter_chunk_timeout;
                 self.sleep.as_mut().reset(new_deadline);
                 Poll::Ready(Some(Ok(item)))
             }
@@ -70,9 +76,20 @@ where
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => {
                 if self.sleep.as_mut().poll(cx).is_ready() {
+                    let err_msg = if self.has_received_first_chunk {
+                        format!(
+                            "Upstream inter-chunk timeout: {:?} elapsed with zero bytes",
+                            self.inter_chunk_timeout
+                        )
+                    } else {
+                        format!(
+                            "Upstream TTFB timeout: {:?} elapsed with zero tokens received (thinking timeout)",
+                            self.ttfb_timeout
+                        )
+                    };
                     Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "Upstream chunk idle timeout: 30s elapsed with zero bytes",
+                        err_msg,
                     ))))
                 } else {
                     Poll::Pending
@@ -82,7 +99,7 @@ where
     }
 }
 
-/// Core HTTP proxy gateway handler for OpenAI chat completions.
+/// Core HTTP proxy gateway handler for LLM chat completions.
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -94,12 +111,17 @@ pub async fn handle_chat_completion(
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
 
-    // Step 1: Canonicalization & BLAKE3 Hashing (with tenant isolation & default normalization)
-    let canonical_res = canonicalize_and_hash(&payload_bytes, auth_str)?;
+    // Step 1: Detect Provider & Canonicalize & BLAKE3 Hash
+    let provider_hint = headers
+        .get("x-semcache-provider")
+        .and_then(|h| h.to_str().ok());
+    let provider = Provider::from_hint(provider_hint, &state.upstream_url);
+
+    let canonical_res = canonicalize_and_hash(&payload_bytes, auth_str, provider)?;
     let hash = canonical_res.hash;
     let canonical_val = canonical_res.canonical_value;
 
-    // Step 1.1: Non-Blocking Streaming Bypass with Per-Chunk Idle Timeout
+    // Step 1.1: Non-Blocking Streaming Bypass with Dual-Stage TTFB/Inter-Chunk Timeout
     if canonical_res.is_streaming {
         let mut req_builder = state
             .http_client
@@ -119,7 +141,12 @@ pub async fn handle_chat_completion(
             return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
         }
 
-        let idle_stream = IdleTimeoutStream::new(upstream_resp.bytes_stream(), Duration::from_secs(30));
+        // Dual timeout: 180s for TTFB (reasoning models), 30s inter-chunk watchdog
+        let idle_stream = IdleTimeoutStream::new(
+            upstream_resp.bytes_stream(),
+            Duration::from_secs(180),
+            Duration::from_secs(30),
+        );
         let stream_body = Body::from_stream(idle_stream);
         return Response::builder()
             .status(status)
@@ -160,19 +187,20 @@ pub async fn handle_chat_completion(
             )
                 .into_response());
         }
-        CoalesceResult::Primary(mut guard) => {
-            let rx = guard.tx.subscribe();
+        CoalesceResult::Primary(mut guard, leader_rx) => {
             let http_client = state.http_client.clone();
             let upstream_url = state.upstream_url.clone();
             let db_pool = state.db.clone();
             let auth_header_opt = auth_str.map(|s| s.to_string());
             let payload_bytes_clone = payload_bytes.clone();
             let canonical_val_clone = canonical_val.clone();
+            let write_semaphore = state.sqlite_write_semaphore.clone();
 
             tokio::spawn(async move {
-                // CRITICAL FIX (Ghost Tasks):
-                // If the initiating client disconnected before upstream dispatch and no followers joined,
-                // abort immediately to avoid burning upstream OpenAI tokens!
+                // CRITICAL FIX (Ghost Tasks without t=0 race):
+                // The leader is subscribed atomically upon creation.
+                // If the initiating client disconnected before upstream dispatch,
+                // `leader_rx` was dropped by Axum, making `receiver_count() == 0`.
                 if !guard.has_active_listeners() {
                     tracing::info!("Ghost task aborted: 0 active listeners before upstream fetch.");
                     guard.evict();
@@ -213,7 +241,7 @@ pub async fn handle_chat_completion(
                 // 1. Mark state in InFlightMap as Ready(bytes, timestamp) & broadcast to current subscribers
                 guard.mark_ready_and_broadcast(resp_bytes.clone());
 
-                // 2. Persist to SQLite WAL with strict 5-second timeout safety
+                // 2. Persist to SQLite WAL with strict semaphore backpressure to prevent Tokio threadpool exhaustion!
                 let model = canonical_val_clone
                     .get("model")
                     .and_then(|m| m.as_str())
@@ -222,29 +250,38 @@ pub async fn handle_chat_completion(
                 let req_json_str = canonical_val_clone.to_string();
                 let resp_json_str = String::from_utf8_lossy(&resp_bytes).into_owned();
 
-                let write_res = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    tokio::task::spawn_blocking(move || {
-                        insert_exact_cache(
-                            &db_pool,
-                            &hash,
-                            &model,
-                            &req_json_str,
-                            &resp_json_str,
-                        )
-                    }),
+                // Acquire write permit under backpressure (bounded wait of 250ms)
+                let permit_res = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    write_semaphore.acquire_owned(),
                 )
                 .await;
 
-                if write_res.is_err() {
-                    tracing::error!("SQLite write timed out after 5s; evicting from memory to prevent leak.");
+                match permit_res {
+                    Ok(Ok(permit)) => {
+                        // Bounded concurrency guaranteed: at most N blocking threads ever run concurrently
+                        let write_handle = tokio::task::spawn_blocking(move || {
+                            let _permit = permit; // Held until SQLite disk write commits or fails
+                            insert_exact_cache(
+                                &db_pool,
+                                &hash,
+                                &model,
+                                &req_json_str,
+                                &resp_json_str,
+                            )
+                        });
+                        let _ = write_handle.await;
+                    }
+                    _ => {
+                        tracing::warn!("SQLite write backpressure saturated; dropping async disk write to protect threadpool");
+                    }
                 }
 
-                // 3. Evict from memory once SQLite write commits or times out
+                // 3. Evict from memory once SQLite write commits or is skipped under backpressure
                 guard.evict();
             });
 
-            (rx, true)
+            (leader_rx, true)
         }
     };
 

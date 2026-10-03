@@ -23,7 +23,8 @@ pub struct RequestCoalescer {
 #[derive(Debug)]
 pub enum CoalesceResult {
     /// The caller is the primary/leader worker responsible for fetching upstream.
-    Primary(LeaderGuard),
+    /// Provides the `LeaderGuard` and the leader's own atomically subscribed receiver.
+    Primary(LeaderGuard, broadcast::Receiver<InFlightPayload>),
     /// Another concurrent worker already fetched this request; the result is returned here.
     Coalesced(Bytes),
 }
@@ -63,9 +64,10 @@ impl LeaderGuard {
 
     /// Checks if there are any active clients awaiting this request.
     ///
-    /// CRITICAL FIX (Ghost Tasks):
-    /// If receiver_count() == 0, the initiating client has disconnected and no
-    /// followers have joined. The leader task can abort immediately to save upstream API costs.
+    /// CRITICAL FIX (Ghost Tasks without t=0 race):
+    /// Because the leader is subscribed atomically at `register_or_wait`,
+    /// `receiver_count() == 0` strictly indicates that the initiating client
+    /// has dropped connection (e.g. laptop closed) and zero followers have subscribed.
     pub fn has_active_listeners(&self) -> bool {
         self.tx.receiver_count() > 0
     }
@@ -102,7 +104,7 @@ impl RequestCoalescer {
     ///   If fresh (< 10s), returns immediately from memory.
     ///   If stale (> 10s), evicts from memory and creates a new cycle.
     /// - If Pending(tx) is present: subscribes and awaits broadcast.
-    /// - If Vacant: atomically inserts Pending and becomes Primary Leader.
+    /// - If Vacant: atomically inserts Pending and becomes Primary Leader with an active subscriber.
     pub async fn register_or_wait(&self, hash: [u8; 32]) -> Result<CoalesceResult, SemCacheError> {
         let mut rx = {
             use dashmap::mapref::entry::Entry;
@@ -115,14 +117,18 @@ impl RequestCoalescer {
                             } else {
                                 // Stale entry; evict and create a fresh cycle
                                 let (tx, _rx) = broadcast::channel(64);
+                                let leader_rx = tx.subscribe();
                                 drop(_rx);
                                 entry.insert(CoalesceState::Pending(tx.clone()));
-                                return Ok(CoalesceResult::Primary(LeaderGuard {
-                                    hash,
-                                    in_flight: self.in_flight.clone(),
-                                    tx,
-                                    completed: false,
-                                }));
+                                return Ok(CoalesceResult::Primary(
+                                    LeaderGuard {
+                                        hash,
+                                        in_flight: self.in_flight.clone(),
+                                        tx,
+                                        completed: false,
+                                    },
+                                    leader_rx,
+                                ));
                             }
                         }
                         CoalesceState::Pending(tx) => tx.subscribe(),
@@ -130,14 +136,18 @@ impl RequestCoalescer {
                 }
                 Entry::Vacant(entry) => {
                     let (tx, _rx) = broadcast::channel(64);
+                    let leader_rx = tx.subscribe();
                     drop(_rx);
                     entry.insert(CoalesceState::Pending(tx.clone()));
-                    return Ok(CoalesceResult::Primary(LeaderGuard {
-                        hash,
-                        in_flight: self.in_flight.clone(),
-                        tx,
-                        completed: false,
-                    }));
+                    return Ok(CoalesceResult::Primary(
+                        LeaderGuard {
+                            hash,
+                            in_flight: self.in_flight.clone(),
+                            tx,
+                            completed: false,
+                        },
+                        leader_rx,
+                    ));
                 }
             }
         };
@@ -170,8 +180,8 @@ mod tests {
         let hash = [42u8; 32];
 
         let primary_res = coalescer.register_or_wait(hash).await.unwrap();
-        let mut guard = match primary_res {
-            CoalesceResult::Primary(g) => g,
+        let (mut guard, _leader_rx) = match primary_res {
+            CoalesceResult::Primary(g, rx) => (g, rx),
             _ => panic!("Expected primary worker"),
         };
 
@@ -204,21 +214,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_coalescer_follower_receives_error_without_deadlock() {
+        let coalescer = RequestCoalescer::new();
+        let hash = [99u8; 32];
+
+        let primary_res = coalescer.register_or_wait(hash).await.unwrap();
+        let (guard, _leader_rx) = match primary_res {
+            CoalesceResult::Primary(g, rx) => (g, rx),
+            _ => panic!("Expected primary worker"),
+        };
+
+        let coalescer_clone = coalescer.clone();
+        let follower_handle = tokio::spawn(async move {
+            coalescer_clone.register_or_wait(hash).await
+        });
+
+        tokio::task::yield_now().await;
+
+        // Leader broadcasts upstream error (e.g. 504 Gateway Timeout)
+        guard.broadcast_error(SemCacheError::UpstreamError(504, "Upstream Gateway Timeout".to_string()));
+
+        let follower_res = follower_handle.await.unwrap();
+        match follower_res {
+            Err(SemCacheError::UpstreamError(code, msg)) => {
+                assert_eq!(code, 504);
+                assert!(msg.contains("Upstream Gateway Timeout"));
+            }
+            other => panic!("Expected UpstreamError, got: {:?}", other),
+        }
+
+        assert!(!coalescer.in_flight.contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_leader_dropped_prematurely_notifies_followers() {
+        let coalescer = RequestCoalescer::new();
+        let hash = [123u8; 32];
+
+        let primary_res = coalescer.register_or_wait(hash).await.unwrap();
+        let (guard, _leader_rx) = match primary_res {
+            CoalesceResult::Primary(g, rx) => (g, rx),
+            _ => panic!("Expected primary worker"),
+        };
+
+        let coalescer_clone = coalescer.clone();
+        let follower_handle = tokio::spawn(async move {
+            coalescer_clone.register_or_wait(hash).await
+        });
+
+        tokio::task::yield_now().await;
+
+        // Simulate crash / panic / cancel: LeaderGuard dropped without calling mark_ready
+        drop(guard);
+
+        let follower_res = follower_handle.await.unwrap();
+        match follower_res {
+            Err(SemCacheError::UpstreamError(code, msg)) => {
+                assert_eq!(code, 502);
+                assert!(msg.contains("terminated without completing response"));
+            }
+            other => panic!("Expected 502 error from dropped guard, got: {:?}", other),
+        }
+
+        assert!(!coalescer.in_flight.contains_key(&hash));
+    }
+
+    #[tokio::test]
     async fn test_ghost_task_listener_count_detection() {
         let coalescer = RequestCoalescer::new();
         let hash = [88u8; 32];
 
         let primary_res = coalescer.register_or_wait(hash).await.unwrap();
-        let guard = match primary_res {
-            CoalesceResult::Primary(g) => g,
+        let (guard, leader_rx) = match primary_res {
+            CoalesceResult::Primary(g, rx) => (g, rx),
             _ => panic!("Expected primary worker"),
         };
 
-        // When only the primary registered and no subscriber exists on guard.tx:
-        assert!(!guard.has_active_listeners());
+        // When leader is connected:
+        assert!(guard.has_active_listeners(), "Leader must be registered as active listener at t=0");
 
-        // Now a follower subscribes
-        let _sub = guard.tx.subscribe();
-        assert!(guard.has_active_listeners());
+        // Follower connects:
+        let follower_sub = guard.tx.subscribe();
+        assert_eq!(guard.tx.receiver_count(), 2);
+
+        // Leader disconnects (client closes laptop):
+        drop(leader_rx);
+        assert!(guard.has_active_listeners(), "Follower still keeps task alive");
+
+        // Follower disconnects:
+        drop(follower_sub);
+        assert!(!guard.has_active_listeners(), "With zero listeners, task is detected as ghost");
     }
 }

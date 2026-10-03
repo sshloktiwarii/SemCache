@@ -20,3 +20,10 @@ Cargo.lock
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.wal
+*.shm
+
+# Environment & Secrets
+.env
+.env.*
+*.env

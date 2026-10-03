@@ -71,11 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let max_concurrent_writes: usize = std::env::var("SEMCACHE_MAX_CONCURRENT_WRITES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let sqlite_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_writes));
+
     let state = AppState {
         db: pool,
         http_client,
         coalescer,
         upstream_url,
+        sqlite_write_semaphore,
     };
 
     let app = Router::new()
