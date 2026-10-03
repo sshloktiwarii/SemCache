@@ -6,20 +6,21 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum SemCacheError {
     #[error("Database error: {0}")]
-    DbError(#[from] rusqlite::Error),
+    DbError(String),
 
     #[error("Database connection pool error: {0}")]
-    PoolError(#[from] r2d2::Error),
+    PoolError(String),
 
     #[error("Upstream HTTP client error: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(String),
 
     #[error("JSON serialization/deserialization error: {0}")]
-    JsonError(#[from] serde_json::Error),
+    JsonError(String),
 
+    #[allow(dead_code)]
     #[error("Streaming requests (stream: true) are not supported in MVP")]
     StreamingNotSupported,
 
@@ -28,6 +29,30 @@ pub enum SemCacheError {
 
     #[error("Internal gateway error: {0}")]
     InternalError(String),
+}
+
+impl From<rusqlite::Error> for SemCacheError {
+    fn from(e: rusqlite::Error) -> Self {
+        SemCacheError::DbError(e.to_string())
+    }
+}
+
+impl From<r2d2::Error> for SemCacheError {
+    fn from(e: r2d2::Error) -> Self {
+        SemCacheError::PoolError(e.to_string())
+    }
+}
+
+impl From<reqwest::Error> for SemCacheError {
+    fn from(e: reqwest::Error) -> Self {
+        SemCacheError::HttpError(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for SemCacheError {
+    fn from(e: serde_json::Error) -> Self {
+        SemCacheError::JsonError(e.to_string())
+    }
 }
 
 impl IntoResponse for SemCacheError {

@@ -1,4 +1,5 @@
 use axum::{
+    body::Body,
     extract::{Json, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -21,8 +22,13 @@ pub struct AppState {
 }
 
 /// Core HTTP proxy gateway handler for OpenAI chat completions.
-/// Normalizes the request, checks L1 cache, coalesces concurrent identical requests,
-/// fetches upstream, asynchronously persists cache, and unblocks in-flight receivers.
+///
+/// Implements:
+/// - Transparent Streaming Bypass (Flaw #11)
+/// - Multi-Tenant Authorization Isolation (Flaw #4)
+/// - Syntax-Preserving Canonicalization (Flaw #3)
+/// - Atomic Single-Flight Coalescing (Flaws #1, #2, #6)
+/// - Zero Error Cache Poisoning (Flaw #5)
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -30,8 +36,45 @@ pub async fn handle_chat_completion(
 ) -> Result<Response, SemCacheError> {
     let payload_bytes = serde_json::to_vec(&payload)?;
 
-    // Step 1: Canonicalization & BLAKE3 Hashing
-    let (hash, canonical_val) = canonicalize_and_hash(&payload_bytes)?;
+    // Extract authorization header for tenant-isolated caching
+    let auth_str = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+
+    // Step 1: Canonicalization & BLAKE3 Hashing (with tenant isolation)
+    let canonical_res = canonicalize_and_hash(&payload_bytes, auth_str)?;
+    let hash = canonical_res.hash;
+    let canonical_val = canonical_res.canonical_value;
+
+    // Step 1.1: CRITICAL FIX (Flaw #11 - Non-Blocking Streaming Bypass)
+    // If client requested streaming, bypass cache & coalescing to stream raw SSE chunks back.
+    if canonical_res.is_streaming {
+        let mut req_builder = state
+            .http_client
+            .post(&state.upstream_url)
+            .header(header::CONTENT_TYPE, "application/json");
+
+        if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
+            req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
+        }
+
+        let upstream_resp = req_builder.body(payload_bytes).send().await?;
+        let status = upstream_resp.status();
+
+        if !status.is_success() {
+            let err_bytes = upstream_resp.bytes().await?;
+            let err_msg = String::from_utf8_lossy(&err_bytes).into_owned();
+            return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
+        }
+
+        let stream_body = Body::from_stream(upstream_resp.bytes_stream());
+        return Ok(Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header("x-semcache-status", "BYPASS_STREAM")
+            .body(stream_body)
+            .map_err(|e| SemCacheError::InternalError(e.to_string()))?);
+    }
 
     // Step 2: L1 Exact Match Cache Lookup
     let pool_clone = state.db.clone();
@@ -51,7 +94,7 @@ pub async fn handle_chat_completion(
             .into_response());
     }
 
-    // Step 3: Single-Flight Request Coalescing
+    // Step 3: Single-Flight Request Coalescing (Atomic & Race-Free)
     let leader_guard = match state.coalescer.register_or_wait(hash).await? {
         CoalesceResult::Coalesced(coalesced_bytes) => {
             return Ok((
@@ -67,17 +110,7 @@ pub async fn handle_chat_completion(
         CoalesceResult::Primary(guard) => guard,
     };
 
-    // Step 4 (L2 Skip for MVP):
-    // =========================================================================
-    // PHASE 2 (L2 FUZZY CACHE HOOK):
-    // 1. Asynchronously fetch embedding vector for canonical prompt via text-embedding-3-small.
-    // 2. Query sqlite-vec virtual table:
-    //    SELECT id, distance FROM fuzzy_cache WHERE embedding MATCH ?1 AND distance <= 0.08
-    //    ORDER BY distance LIMIT 1;
-    // 3. If match found (cosine similarity >= 0.92), fetch response from fuzzy_payloads and return.
-    // =========================================================================
-
-    // Step 5: Upstream Forwarding
+    // Step 4: Upstream Forwarding
     let mut req_builder = state
         .http_client
         .post(&state.upstream_url)
@@ -87,18 +120,35 @@ pub async fn handle_chat_completion(
         req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
     }
 
-    let upstream_resp = req_builder.body(payload_bytes).send().await?;
-    let status = upstream_resp.status();
-    let resp_bytes = upstream_resp.bytes().await?;
+    let upstream_resp = match req_builder.body(payload_bytes).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let err = SemCacheError::from(e);
+            leader_guard.broadcast_error(err.clone());
+            return Err(err);
+        }
+    };
 
+    let status = upstream_resp.status();
+    let resp_bytes = match upstream_resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            let err = SemCacheError::from(e);
+            leader_guard.broadcast_error(err.clone());
+            return Err(err);
+        }
+    };
+
+    // Step 5: CRITICAL FIX (Flaw #5 - Never Poison Cache With Errors)
     if !status.is_success() {
-        // Crucial: Do not cache error responses or rate limit failures
         let err_msg = String::from_utf8_lossy(&resp_bytes).into_owned();
-        drop(leader_guard);
-        return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
+        let upstream_err = SemCacheError::UpstreamError(status.as_u16(), err_msg);
+        // Broadcast the failure to any awaiting followers so they fail immediately
+        leader_guard.broadcast_error(upstream_err.clone());
+        return Err(upstream_err);
     }
 
-    // Step 6: Asynchronous Persistence to SQLite WAL
+    // Step 6: Asynchronous Persistence to SQLite WAL (Only 200 OK responses)
     let pool_persist = state.db.clone();
     let model = canonical_val
         .get("model")
@@ -120,8 +170,8 @@ pub async fn handle_chat_completion(
         }
     });
 
-    // Step 7: Broadcast result to any pending coalesced subscribers
-    leader_guard.broadcast(resp_bytes.clone());
+    // Step 7: CRITICAL FIX (Flaw #6): Remove-First Broadcast to followers
+    leader_guard.broadcast_success(resp_bytes.clone());
 
     Ok((
         StatusCode::OK,

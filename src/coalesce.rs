@@ -4,13 +4,15 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 use crate::error::SemCacheError;
 
-pub type InFlightMap = Arc<DashMap<[u8; 32], broadcast::Sender<Bytes>>>;
+pub type InFlightPayload = Result<Bytes, Arc<SemCacheError>>;
+pub type InFlightMap = Arc<DashMap<[u8; 32], broadcast::Sender<InFlightPayload>>>;
 
 #[derive(Clone, Default)]
 pub struct RequestCoalescer {
     in_flight: InFlightMap,
 }
 
+#[derive(Debug)]
 pub enum CoalesceResult {
     /// The caller is the primary/leader worker responsible for fetching upstream and broadcasting.
     Primary(LeaderGuard),
@@ -21,21 +23,54 @@ pub enum CoalesceResult {
 pub struct LeaderGuard {
     hash: [u8; 32],
     in_flight: InFlightMap,
-    tx: broadcast::Sender<Bytes>,
+    tx: broadcast::Sender<InFlightPayload>,
+    completed: bool,
+}
+
+impl std::fmt::Debug for LeaderGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeaderGuard")
+            .field("hash", &self.hash)
+            .field("completed", &self.completed)
+            .finish()
+    }
 }
 
 impl LeaderGuard {
-    /// Broadcasts the response payload to all coalesced waiting clients and cleans up the in-flight map.
-    pub fn broadcast(self, data: Bytes) {
-        let _ = self.tx.send(data);
+    /// Broadcasts success payload to all waiting followers.
+    ///
+    /// CRITICAL FIX (Flaw #6): Remove the hash from `in_flight` map FIRST.
+    /// This closes the race window where a late-arriving request subscribes
+    /// after `send()` has already occurred and deadlocks.
+    pub fn broadcast_success(mut self, data: Bytes) {
+        self.completed = true;
+        // 1. Remove from map first so any subsequent arrival becomes a new leader
         self.in_flight.remove(&self.hash);
+        // 2. Broadcast result to all currently awaiting subscribers
+        let _ = self.tx.send(Ok(data));
+    }
+
+    /// Broadcasts upstream failure to all waiting followers.
+    ///
+    /// CRITICAL FIX (Flaw #2 & #5): Followers receive the exact upstream failure
+    /// rather than deadlocking or hanging on channel closure.
+    pub fn broadcast_error(mut self, err: SemCacheError) {
+        self.completed = true;
+        self.in_flight.remove(&self.hash);
+        let _ = self.tx.send(Err(Arc::new(err)));
     }
 }
 
 impl Drop for LeaderGuard {
     fn drop(&mut self) {
-        // Guarantee the in-flight entry is cleaned up if dropped prematurely (e.g. on upstream error)
-        self.in_flight.remove(&self.hash);
+        if !self.completed {
+            // Leader aborted or dropped prematurely (e.g. client cancellation or panic)
+            self.in_flight.remove(&self.hash);
+            let _ = self.tx.send(Err(Arc::new(SemCacheError::UpstreamError(
+                502,
+                "In-flight primary worker terminated without completing response".to_string(),
+            ))));
+        }
     }
 }
 
@@ -46,9 +81,11 @@ impl RequestCoalescer {
         }
     }
 
-    /// Atomically checks if an in-flight request exists for `hash`.
-    /// - If found, subscribes to the channel and awaits the response.
-    /// - If not found, registers a new channel and returns `CoalesceResult::Primary`.
+    /// Atomically checks if an in-flight request exists for `hash` using DashMap entry shard locking.
+    ///
+    /// CRITICAL FIX (Flaw #1): Acquire the shard lock via `DashMap::entry(hash)`.
+    /// `Entry::Vacant` atomically becomes Primary Leader.
+    /// `Entry::Occupied` atomically subscribes to the leader's broadcast channel.
     pub async fn register_or_wait(&self, hash: [u8; 32]) -> Result<CoalesceResult, SemCacheError> {
         let mut rx = {
             use dashmap::mapref::entry::Entry;
@@ -61,17 +98,19 @@ impl RequestCoalescer {
                         hash,
                         in_flight: self.in_flight.clone(),
                         tx,
+                        completed: false,
                     }));
                 }
             }
         };
 
         match rx.recv().await {
-            Ok(data) => Ok(CoalesceResult::Coalesced(data)),
+            Ok(Ok(data)) => Ok(CoalesceResult::Coalesced(data)),
+            Ok(Err(err)) => Err((*err).clone()),
             Err(broadcast::error::RecvError::Closed) => {
                 Err(SemCacheError::UpstreamError(
                     502,
-                    "In-flight primary worker terminated without broadcasting response".to_string(),
+                    "In-flight primary worker channel closed unexpectedly".to_string(),
                 ))
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -88,18 +127,16 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_request_coalescer_single_flight() {
+    async fn test_request_coalescer_single_flight_success() {
         let coalescer = RequestCoalescer::new();
         let hash = [42u8; 32];
 
-        // First caller registers as Primary
         let primary_res = coalescer.register_or_wait(hash).await.unwrap();
         let guard = match primary_res {
             CoalesceResult::Primary(g) => g,
             _ => panic!("Expected primary worker"),
         };
 
-        // Spawn a second task awaiting the same hash
         let coalescer_clone = coalescer.clone();
         let handle = tokio::spawn(async move {
             let res = coalescer_clone.register_or_wait(hash).await.unwrap();
@@ -109,16 +146,72 @@ mod tests {
             }
         });
 
-        // Yield to allow task to subscribe
         tokio::task::yield_now().await;
 
         let expected_payload = Bytes::from_static(b"{\"result\": \"success\"}");
-        guard.broadcast(expected_payload.clone());
+        guard.broadcast_success(expected_payload.clone());
 
         let coalesced_payload = handle.await.unwrap();
         assert_eq!(coalesced_payload, expected_payload);
+        assert!(!coalescer.in_flight.contains_key(&hash));
+    }
 
-        // After broadcast, in-flight map must be empty for this hash
+    #[tokio::test]
+    async fn test_request_coalescer_follower_receives_error_without_deadlock() {
+        let coalescer = RequestCoalescer::new();
+        let hash = [99u8; 32];
+
+        let primary_res = coalescer.register_or_wait(hash).await.unwrap();
+        let guard = match primary_res {
+            CoalesceResult::Primary(g) => g,
+            _ => panic!("Expected primary worker"),
+        };
+
+        let coalescer_clone = coalescer.clone();
+        let handle = tokio::spawn(async move {
+            coalescer_clone.register_or_wait(hash).await
+        });
+
+        tokio::task::yield_now().await;
+
+        // Leader broadcasts an upstream failure
+        guard.broadcast_error(SemCacheError::UpstreamError(429, "Rate limit exceeded".to_string()));
+
+        let follower_res = handle.await.unwrap();
+        assert!(follower_res.is_err());
+        match follower_res.unwrap_err() {
+            SemCacheError::UpstreamError(code, msg) => {
+                assert_eq!(code, 429);
+                assert_eq!(msg, "Rate limit exceeded");
+            }
+            other => panic!("Expected UpstreamError 429, got {:?}", other),
+        }
+        assert!(!coalescer.in_flight.contains_key(&hash));
+    }
+
+    #[tokio::test]
+    async fn test_leader_dropped_prematurely_notifies_followers() {
+        let coalescer = RequestCoalescer::new();
+        let hash = [123u8; 32];
+
+        let primary_res = coalescer.register_or_wait(hash).await.unwrap();
+        let guard = match primary_res {
+            CoalesceResult::Primary(g) => g,
+            _ => panic!("Expected primary worker"),
+        };
+
+        let coalescer_clone = coalescer.clone();
+        let handle = tokio::spawn(async move {
+            coalescer_clone.register_or_wait(hash).await
+        });
+
+        tokio::task::yield_now().await;
+
+        // Leader drops without explicit broadcast
+        drop(guard);
+
+        let follower_res = handle.await.unwrap();
+        assert!(follower_res.is_err());
         assert!(!coalescer.in_flight.contains_key(&hash));
     }
 }

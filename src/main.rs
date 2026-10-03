@@ -3,15 +3,16 @@ mod coalesce;
 mod db;
 mod error;
 mod proxy;
+mod vector;
 
 use axum::{routing::post, Router};
 use std::time::Duration;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     coalesce::RequestCoalescer,
-    db::init_db_pool,
+    db::{init_db_pool, prune_expired_records},
     proxy::{handle_chat_completion, AppState},
 };
 
@@ -29,16 +30,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let upstream_url = std::env::var("OPENAI_UPSTREAM_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
     let bind_addr = std::env::var("SEMCACHE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let ttl_days: i64 = std::env::var("SEMCACHE_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    let upstream_timeout_secs: u64 = std::env::var("SEMCACHE_UPSTREAM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
 
     info!("Initializing SQLite WAL persistence layer at '{}'...", db_path);
     let pool = init_db_pool(&db_path)?;
 
+    // CRITICAL FIX (Flaw #10): Strict upstream timeouts to prevent worker socket starvation
     let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(upstream_timeout_secs))
+        .connect_timeout(Duration::from_secs(10))
         .pool_max_idle_per_host(32)
         .build()?;
 
     let coalescer = RequestCoalescer::new();
+
+    // CRITICAL FIX (Flaw #9): Periodic background TTL pruning task
+    let prune_pool = pool.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            info!("Running background cache TTL eviction (TTL: {} days)...", ttl_days);
+            let pool_task = prune_pool.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                prune_expired_records(&pool_task, ttl_days)
+            }).await;
+
+            match res {
+                Ok(Ok(deleted)) => {
+                    if deleted > 0 {
+                        info!("Pruned {} expired cache records from SQLite.", deleted);
+                    }
+                }
+                Ok(Err(e)) => error!("TTL eviction failed: {}", e),
+                Err(e) => error!("Eviction task panicked: {}", e),
+            }
+        }
+    });
 
     let state = AppState {
         db: pool,

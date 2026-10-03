@@ -7,7 +7,7 @@ edition = "2021"
 axum = "0.7"
 tokio = { version = "1.36", features = ["full"] }
 hyper = "1.2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"

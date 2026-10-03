@@ -174,3 +174,80 @@ We execute all SQLite cache writes asynchronously in a detached `tokio::task::sp
 
 ### Alternatives Considered
 - **Synchronous Inline DB Writes:** Guarantees 100% immediate cache consistency at the cost of adding 2–5ms of disk latency to every upstream miss.
+
+---
+
+## ADR 007: Multi-Tenant Cache Isolation via Authorization Header Hashing
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Generating cache keys purely from JSON request bodies creates an unintentional authorization bypass: an unauthenticated user or User B can submit prompt $P$ and retrieve a cache hit previously populated by User A, effectively stealing API access.
+
+### Decision
+We incorporate `auth_header: Option<&str>` directly into the BLAKE3 digest calculation (`|auth_tenant:<token>`).
+
+### Consequences
+**Positive:**
+- 100% multi-tenant isolation. Requests authenticated with different API keys generate completely disjoint cache spaces.
+- Zero risk of cross-account data leakage or billing circumvention.
+
+**Negative:**
+- Identical prompts sent across different API keys will not share cache hits (intentional security design).
+
+---
+
+## ADR 008: Syntax-Preserving Non-Destructive Canonicalization
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Aggressively stripping newlines and trimming internal whitespace corrupts code generation prompts (e.g. Python scripts where whitespace defines scope, YAML configurations, Markdown tables).
+
+### Decision
+We preserve all internal whitespace, newlines, and indentation intact. Only outermost string boundaries are trimmed, and generative hyperparameters (`temperature`, `top_p`, `seed`) are retained in the cache key. Only non-generative metadata (`user`) is stripped.
+
+### Consequences
+**Positive:**
+- Zero syntax corruption for code synthesis, YAML, and Markdown prompts.
+- Prompts with different generation dynamics (e.g. `temperature: 0.0` vs `1.0`) do not collide in cache.
+
+---
+
+## ADR 009: Removal-First Atomic Broadcast in Single-Flight Coalescer
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Calling `tx.send(data)` *before* `in_flight.remove(&hash)` creates a critical race window where late-arriving requests subscribe after `send` completed, causing infinite follower deadlocks. Furthermore, leader aborts caused followers to receive unhelpful channel closed errors.
+
+### Decision
+1. The leader removes the hash from `DashMap` **first**, and then broadcasts the payload.
+2. The channel transmits `Result<Bytes, Arc<SemCacheError>>` so upstream errors (e.g. 429 rate limits) are actively propagated to followers without deadlocking.
+
+### Consequences
+**Positive:**
+- Closes the send-then-remove race window completely.
+- Followers receive immediate, accurate upstream error propagation rather than generic 500s or hangs.
+
+---
+
+## ADR 010: Transparent Non-Blocking Streaming Bypass
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Rejecting `stream: true` with HTTP 400 breaks compatibility with standard agent frameworks (LangChain, LlamaIndex, Cursor) that default to streaming completions.
+
+### Decision
+When `stream: true` is detected, SemCache bypasses cache lookup and single-flight coalescing, forwards the request directly upstream, and streams raw Server-Sent Event (SSE) chunks back to the client with `x-semcache-status: BYPASS_STREAM`.
+
+### Consequences
+**Positive:**
+- 100% backward and forward compatibility with all streaming LLM client SDKs.
+- Zero client breakage while preserving unary caching guarantees.
+

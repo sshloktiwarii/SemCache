@@ -57,9 +57,11 @@ SemCache is architected as an embedded, low-latency HTTP reverse proxy gateway. 
 
 ### Core Architectural Tenets
 1. **Zero Vibe-Code / Zero Panics:** No `.unwrap()` or `.expect()` in production execution paths. All internal errors are encapsulated in a strongly typed domain error hierarchy.
-2. **Deterministic Canonicalization:** Requests with identical semantic intent but varied syntactical noise (formatting, key order, hyperparameters) produce mathematically identical BLAKE3 hashes.
-3. **Off-Critical-Path Persistence:** Cache disk writes occur asynchronously in background Tokio blocking worker pools. The client's response delivery is never gated on SQLite disk commits.
-4. **Stampede Resilience:** Single-flight request coalescing ensures that $N$ simultaneous identical agent prompts result in exactly 1 upstream API request.
+2. **Multi-Tenant Cache Isolation:** Authorization bearer tokens are salted directly into the BLAKE3 key derivation digest. User A and User B never share cache entries or bypass API billing.
+3. **Syntax-Preserving Canonicalization:** Code blocks, Python indentation, YAML spacing, and Markdown line breaks are preserved verbatim. Only non-generative client tracking fields (`user`) are stripped; generative hyperparameters (`temperature`, `top_p`, `seed`) remain preserved.
+4. **Stampede Resilience & Race-Free Broadcast:** Single-flight request coalescing uses DashMap shard locking. The leader removes the in-flight entry *before* broadcasting, eliminating subscriber deadlocks, and broadcasts typed `Result` payloads so followers receive exact upstream failures (429/500).
+5. **Transparent Streaming Bypass:** `stream: true` requests bypass caching and stream SSE chunks directly to clients without 400 errors or buffer accumulation.
+6. **Active Vector Similarity Engine:** Evaluates true Cosine Similarity ($A \cdot B / (\|A\| \|B\|)$) on 1536-dimensional float embeddings in SQLite, backed by automated hourly TTL eviction.
 
 ---
 
