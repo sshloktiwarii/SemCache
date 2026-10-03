@@ -11,8 +11,16 @@
 - [ADR 002: Embedded SQLite with WAL & sqlite-vec over External Vector Stores](#adr-002-embedded-sqlite-with-wal--sqlite-vec-over-external-vector-stores)
 - [ADR 003: Single-Flight Request Coalescing via DashMap and Tokio Broadcast](#adr-003-single-flight-request-coalescing-via-dashmap-and-tokio-broadcast)
 - [ADR 004: BLAKE3 as the L1 Cryptographic Key Derivation Function](#adr-004-blake3-as-the-l1-cryptographic-key-derivation-function)
-- [ADR 005: Strict Rejection of Server-Sent Events (SSE) Streaming in MVP](#adr-005-strict-rejection-of-server-sent-events-sse-streaming-in-mvp)
+- [ADR 005: Strict Rejection of Server-Sent Events (SSE) Streaming in MVP (Superseded)](#adr-005-strict-rejection-of-server-sent-events-sse-streaming-in-mvp)
 - [ADR 006: Asynchronous Off-Critical-Path Persistence to SQLite](#adr-006-asynchronous-off-critical-path-persistence-to-sqlite)
+- [ADR 007: Mandatory Resource Attribution for CLI Tools](#adr-007-mandatory-resource-attribution-for-cli-tools)
+- [ADR 008: Syntax-Preserving Non-Destructive Canonicalization](#adr-008-syntax-preserving-non-destructive-canonicalization)
+- [ADR 009: Removal-First Atomic Broadcast in Single-Flight Coalescer](#adr-009-removal-first-atomic-broadcast-in-single-flight-coalescer)
+- [ADR 010: Transparent Non-Blocking Streaming Bypass with Dual-Stage Timeout](#adr-010-transparent-non-blocking-streaming-bypass)
+- [ADR 011: Bounded Concurrency Semaphore for SQLite Disk Writers](#adr-011-bounded-concurrency-semaphore-for-sqlite-disk-writers)
+- [ADR 012: Provider-Aware Default Hyperparameter Normalization](#adr-012-provider-aware-default-hyperparameter-normalization)
+- [ADR 013: State-Gated In-Flight RAII Guard Lifecycle](#adr-013-state-gated-in-flight-raii-guard-lifecycle)
+- [ADR 014: SemCache v1.1 Architectural Blueprint](#adr-014-semcache-v11-architectural-blueprint)
 
 ---
 
@@ -128,7 +136,7 @@ We use **BLAKE3** (`blake3 1.5`) as the primary hashing engine for L1 determinis
 ## ADR 005: Strict Rejection of Server-Sent Events (SSE) Streaming in MVP
 
 ### Status
-**Accepted** (Implemented in Phase 1)
+**Superseded by ADR 010** (Replaced with Transparent Non-Blocking Streaming Bypass)
 
 ### Context
 OpenAI chat completions support `stream: true` using Server-Sent Events (SSE). Handling streaming responses in an exact/semantic cache gateway requires:
@@ -250,4 +258,110 @@ When `stream: true` is detected, SemCache bypasses cache lookup and single-fligh
 **Positive:**
 - 100% backward and forward compatibility with all streaming LLM client SDKs.
 - Zero client breakage while preserving unary caching guarantees.
+
+---
+
+## ADR 011: Bounded Concurrency Semaphore for SQLite Disk Writers
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Wrapping `tokio::task::spawn_blocking` in `tokio::time::timeout` does not abort or cancel the underlying OS thread when the timeout triggers. Under SQLite disk lock contention, hundreds of abandoned blocking tasks accumulate, exhausting Tokio's 512-thread blocking pool and starving the server.
+
+### Decision
+1. Bound concurrent disk write tasks via an `Arc<tokio::sync::Semaphore>` in `AppState` (default: 4 concurrent writes, matching SQLite's single-writer architecture).
+2. Configure `PRAGMA busy_timeout = 5000;` on all SQLite connections so OS threads back off after 5 seconds instead of blocking indefinitely.
+3. If the semaphore cannot be acquired within 250ms, safely drop the disk write under backpressure and immediately evict the in-flight memory entry.
+
+### Consequences
+**Positive:**
+- Tokio's blocking threadpool cannot be exhausted even under catastrophic disk I/O stalls.
+- Excess cache writes are dropped gracefully without failing client HTTP responses.
+
+---
+
+## ADR 012: Provider-Aware Default Hyperparameter Normalization
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Hardcoding `temperature: 1.0` as the default is OpenAI-specific. Ollama defaults to `temperature: 0.8` and `top_p: 0.9`. If SemCache were pointed at an Ollama instance, an explicit `temperature: 1.0` is non-default, but would previously be stripped, causing distinct requests to collide into the same bucket.
+
+### Decision
+1. Implement a `Provider` enum (`OpenAi`, `Ollama`, `Generic`).
+2. Provide explicit configuration via `SEMCACHE_DEFAULT_PROVIDER` and per-request override via `x-semcache-provider` header.
+3. When provider is `Ollama`, normalize `temperature: 0.8` and `top_p: 0.9` (retaining `1.0` verbatim). When provider is `Generic`, preserve all parameters verbatim.
+
+### Consequences
+**Positive:**
+- Eliminates the Ollama Trap and cross-provider cache divergence.
+- Explicit operator control over default parameter normalization.
+
+---
+
+## ADR 013: State-Gated In-Flight RAII Guard Lifecycle
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+If `LeaderGuard::drop` unconditionally removes the entry from `InFlightMap` and broadcasts an error, dropping the guard after `evict()` has already executed could corrupt subsequent cycles or send spurious error notifications.
+
+### Decision
+Introduce a strict lifecycle enum `GuardState` (`Pending`, `Ready`, `Evicted`):
+- `mark_ready_and_broadcast` transitions to `GuardState::Ready`.
+- `evict` transitions to `GuardState::Evicted`.
+- `Drop for LeaderGuard` only purges the map and broadcasts an error if `self.state == GuardState::Pending`.
+
+### Consequences
+**Positive:**
+- RAII drop safety guarantees zero map corruption or erroneous follower abortion after successful completion.
+
+---
+
+## ADR 014: SemCache v1.1 Architectural Blueprint
+
+### Status
+**Proposed & Roadmapped for v1.1**
+
+### Context & Threat Model
+The v1.0 release established production-grade guarantees for single-flight coalescing, multi-tenant salting, and backpressure. However, system audit exposed three critical second-order failure modes to be addressed in the v1.1 milestone:
+
+1. **The `serde_json` Cargo Feature Unification Vulnerability:**
+   Cargo automatically unifies crate features across the entire dependency graph. If any transitive dependency in the workspace activates `serde_json/preserve_order` (e.g. a CLI parser or OpenTelemetry exporter), `serde_json::Map` silently switches from `BTreeMap` to `IndexMap`. BLAKE3 hashes change silently without compiler warnings, destroying cache hit rates.
+2. **True Disk-Commit Synchronization Verification:**
+   Ensuring that `CoalesceState::Ready` in RAM persists strictly until the background SQLite WAL transaction commits on NVMe/disk. If eviction runs before disk commit finishes, followers arriving in that window trigger duplicate upstream calls.
+3. **Continuous 30-Minute Sustained Production Soak Suite:**
+   Testing beyond burst benchmarks (which execute in hundreds of milliseconds) to sustained multi-gigabyte continuous agent loops that measure long-horizon memory stabilization, WAL checkpoint behavior under pressure, and actual disk write wear.
+
+### Decision & Technical Blueprint for v1.1
+
+#### 1. In-Code Recursive Canonical JSON Key Sorter
+Instead of relying on `serde_json` crate configuration, implement an explicit in-code recursive key sorter that traverses the AST and sorts all object keys into a lexicographically ordered representation:
+```rust
+pub fn canonicalize_json_strictly(val: &Value) -> Vec<u8> {
+    match val {
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            // Deterministically serialize sorted pairs
+        }
+        Value::Array(arr) => { /* recursively format array items */ }
+        _ => { /* format primitives */ }
+    }
+}
+```
+This guarantees mathematical key order determinism regardless of any Cargo workspace feature unification.
+
+#### 2. Synchronized WAL Commit-to-Evict Handoff
+Enforce that `guard.evict()` is invoked strictly within the completion callback of `write_handle.await`, guaranteeing zero time-gap between the memory `Ready` state and the SQLite L1 WAL state.
+
+#### 3. 30-Minute Sustained Continuous Soak Suite
+Construct a dedicated soak test bin (`cargo test --test long_soak -- --ignored`) that:
+- Runs for 30 minutes continuously.
+- Simulates realistic 8k to 32k context-window payloads.
+- Periodically triggers SQLite WAL manual checkpoints (`PRAGMA wal_checkpoint(TRUNCATE)`).
+- Validates flat resident memory (RSS $\Delta \approx 0$).
 

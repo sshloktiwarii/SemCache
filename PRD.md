@@ -1,9 +1,10 @@
 # SemCache: Product Requirements Document (PRD)
 
-**Document Version:** 1.1.0  
+**Document Version:** 1.0.0 (Production Hardened) | **Target Roadmap:** v1.1.0  
 **Status:** Approved & Implemented  
-**Target Release:** SemCache v0.1.0-alpha  
+**Target Release:** SemCache v1.0.0  
 **Author:** Principal Systems Architect  
+**Repository:** [https://github.com/sshloktiwarii/SemCache.git](https://github.com/sshloktiwarii/SemCache.git)
 
 ---
 
@@ -17,22 +18,24 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 
 ### 1.2 The Solution: SemCache
 **SemCache** is an embedded, local-first HTTP proxy gateway designed to sit transparently between client AI applications and OpenAI-compatible LLM endpoints. It delivers cost reduction, latency optimization, and rate-limit preservation through:
-1. **Deterministic Request Canonicalization:** Stripping non-semantic entropy and normalizing text.
-2. **L1 Deterministic Exact-Match Cache:** Sub-millisecond retrieval via SIMD-accelerated BLAKE3 hashing.
-3. **L2 Semantic Vector Cache:** Vector-similarity lookup via embedded `sqlite-vec` (Cosine similarity $\ge 0.92$).
-4. **Single-Flight Request Coalescing:** Consolidating concurrent duplicate requests into a single upstream call.
+1. **Deterministic Request Canonicalization:** Stripping non-semantic metadata and normalizing text while preserving code syntax.
+2. **Multi-Tenant Cache Isolation:** Authorization bearer tokens are salted directly into cache digests.
+3. **L1 Deterministic Exact-Match Cache:** Sub-millisecond retrieval via SIMD-accelerated BLAKE3 hashing.
+4. **Single-Flight Request Coalescing:** Consolidating concurrent duplicate requests into a single upstream call with race-free memory handoff.
+5. **Transparent Streaming Bypass:** Non-blocking passthrough of SSE tokens with dual-stage timeout watchdogs.
+6. **L2 Semantic Vector Cache (Phase 2):** Vector-similarity lookup via embedded `sqlite-vec`.
 
 ```
 [ AI Agent / Client ] 
         │ (POST /v1/chat/completions)
         ▼
 [ SemCache Gateway (Port 3000) ]
-        ├── 1. Canonicalize & Strip Hyperparameters
-        ├── 2. BLAKE3 Hashing
-        ├── 3. L1 Exact Match (SQLite WAL) ────────► [ Cache Hit: < 1.5ms ]
-        ├── 4. Single-Flight Coalesce (DashMap) ───► [ Concurrent Wait: 0 Upstream Tokens ]
-        ├── 5. L2 Vector Search (sqlite-vec) ─────► [ Semantic Hit: < 15ms ]
-        └── 6. Upstream Forwarding ───────────────► [ OpenAI / vLLM / Ollama ]
+        ├── 1. Stream Check (stream == true) ──► [ Transparent SSE Bypass: 180s/30s Watchdog ]
+        ├── 2. Syntax-Preserving Canonicalization & Tenant-Salted Hashing
+        ├── 3. L1 Exact Match (SQLite WAL) ────► [ Cache Hit: < 1.5ms ]
+        ├── 4. Single-Flight Coalesce (DashMap) ► [ Concurrent Wait: 0 Upstream Tokens ]
+        ├── 5. L2 Vector Search (sqlite-vec) ──► [ Phase 2 Roadmap ]
+        └── 6. Upstream Forwarding ───────────► [ OpenAI / vLLM / Ollama ]
 ```
 
 ---
@@ -54,30 +57,28 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 - Must expose an OpenAI-compatible endpoint: `POST /v1/chat/completions`.
 - Must preserve incoming HTTP `Authorization` bearer tokens and pass them upstream.
 
-### FR-02: Request Canonicalization Engine
-- The gateway must parse incoming JSON payloads and strip volatile hyperparameters that do not alter the semantic question:
-  - `temperature`
-  - `top_p`
-  - `presence_penalty`
-  - `frequency_penalty`
-  - `user`
-  - `seed`
-  - `logit_bias`
-- If `stream: false` is present, it must be stripped to prevent cache divergence from omitted keys.
-- **Message Content Normalization:**
-  - Content strings in the `messages` array must be trimmed of leading and trailing whitespace.
-  - Consecutive newlines must be collapsed into a single newline boundary.
-- **Deterministic Serialization:** JSON keys must be serialized in strictly sorted lexicographical order prior to hashing.
+### FR-02: Syntax-Preserving Canonicalization Engine
+- **Non-Generative Metadata Stripping:** The gateway must parse incoming JSON payloads and strip client tracking metadata (`user`).
+- **Default Parameter Stripping:** If `stream: false` is present, it must be stripped to prevent cache divergence from omitted keys.
+- **Generative Hyperparameter Preservation:** Hyperparameters that alter generation dynamics (`temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed`, `logit_bias`) are preserved in the cache key.
+- **Provider-Aware Default Normalization:**
+  - `OpenAi`: Normalizes `temperature: 1.0`, `top_p: 1.0`, `presence_penalty: 0.0`, `frequency_penalty: 0.0`.
+  - `Ollama`: Normalizes `temperature: 0.8`, `top_p: 0.9` (retains `1.0` verbatim).
+  - `Generic`: Preserves all parameters verbatim.
+- **Syntax-Preserving Text Normalization:**
+  - Content strings in `messages` and `prompt` are trimmed only at the outermost string boundaries.
+  - Internal indentation, tabs, newlines, and formatting are preserved 100% verbatim to protect code blocks, YAML, and Markdown.
+- **Multi-Tenant Salting:** Incorporates `auth_header` into the BLAKE3 digest (`|auth_tenant:<token>`) ensuring complete multi-tenant cache isolation.
 
-### FR-03: Non-Blocking Streaming Bypass (MVP Scope)
+### FR-03: Non-Blocking Streaming Bypass
 - If an incoming payload contains `stream: true`, the gateway bypasses caching and transparently proxies the stream to the upstream LLM endpoint.
 - **Dual-Stage Timeout Watchdog:** The stream is wrapped in `IdleTimeoutStream`, enforcing:
   1. A 180-second Time-To-First-Byte (TTFB) timeout to accommodate reasoning models (`o1`, `o3-mini`, `deepseek-r1`) during extended thinking phases.
   2. A 30-second inter-chunk idle watchdog once token streaming commences.
-- Responses are tagged with header `x-semcache-status: BYPASS_STREAM`. Full SSE chunk caching is deferred to v2.0.
+- Responses are tagged with header `x-semcache-status: BYPASS_STREAM`.
 
 ### FR-04: L1 Exact-Match Deterministic Caching
-- Compute a 32-byte BLAKE3 hash over the canonicalized JSON bytes.
+- Compute a 32-byte BLAKE3 hash over the canonicalized JSON bytes with tenant salt.
 - Query the SQLite `exact_cache` table by `canonical_hash`.
 - If a match exists:
   - Return the cached response immediately with HTTP status 200.
@@ -85,29 +86,30 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
   - Content-Type must be `application/json`.
 
 ### FR-05: Single-Flight Request Coalescing
-- When an L1 cache miss occurs, the gateway must check an in-memory `DashMap` for concurrent in-flight requests matching the same BLAKE3 hash.
-- **If an in-flight request exists:** The worker subscribes to a `tokio::sync::broadcast` channel and asynchronously awaits the leader's response. On receipt, it returns the payload with header `x-semcache-status: HIT_COALESCED`.
-- **If no in-flight request exists:** The worker becomes the Primary Leader, registers a broadcast channel in the map, proceeds to upstream execution, and broadcasts the completed payload to all waiting clients upon arrival.
-- **Guaranteed Cleanup:** If the Primary Leader encounters an error or drops unexpectedly, RAII guards must ensure the hash is purged from the `DashMap` to prevent subscriber deadlocks.
+- When an L1 cache miss occurs, the gateway must acquire a DashMap shard lock on `InFlightMap`:
+  - **Follower (Pending):** If an upstream query is in flight, subscribe to a `tokio::sync::broadcast` channel and asynchronously await the leader's response. On receipt, return the payload with header `x-semcache-status: HIT_COALESCED`.
+  - **Follower (Ready):** If the response is already in memory pending disk write, immediately return a clone of the payload.
+  - **Primary Leader:** Register as the leader, retain a state-gated `LeaderGuard`, and proceed to upstream execution.
+- **Error Propagation & Drop Safety:**
+  - If upstream fails (e.g. 429), the leader broadcasts `Err(CoalesceError)` to followers, ensuring followers never hang.
+  - `LeaderGuard` implements state-gated RAII drop: only guards abandoned in `Pending` state purge the map and broadcast errors.
 
-### FR-06: [Phase 2 / Not Shipped] Semantic Vector Search (L2)
-- *MVP Scope Note:* MVP ships with exact-match L1 and coalescing. Native L2 embedding generation via `fastembed-rs` and indexed `sqlite-vec` lookups are deferred to v2.0.
-- If L1 exact match misses, generate an embedding vector for the prompt text (default: 1536-dimensional float vector matching `text-embedding-3-small`).
-- Query the virtual table `fuzzy_cache` using `sqlite-vec`.
-- Evaluate Cosine distance: if $\text{distance} \le 0.08$ (Cosine similarity $\ge 0.92$), return the cached response with `x-semcache-status: HIT_L2`.
-- In MVP release, `init_db_pool` executes a graceful fallback simulation if the `sqlite-vec` dynamic extension is not linked in the local host environment.
+### FR-06: [Phase 2 / Roadmap] Semantic Vector Search (L2)
+- *MVP Scope Note:* v1.0 ships with exact-match L1 and coalescing. Native L2 embedding generation via `fastembed-rs` and indexed `sqlite-vec` lookups are roadmapped for Phase 2.
+- Evaluates Cosine similarity $\ge 0.92$ on 1536-dimensional embeddings.
 
 ### FR-07: Upstream Forwarding & Non-Cacheable Failure Handling
-- When a request misses all cache layers, forward the payload to the configured upstream endpoint (default: `https://api.openai.com/v1/chat/completions`).
-- **Error Propagation:** If upstream returns a non-2xx status code (e.g., 429 Too Many Requests, 500 Server Error):
+- When a request misses all cache layers, forward the payload to the configured upstream endpoint.
+- **Error Propagation:** If upstream returns a non-2xx status code:
   - The error payload and status code must be returned to the client immediately.
   - The error response **MUST NOT** be persisted into the cache.
 
-### FR-08: Asynchronous Persistence Layer
+### FR-08: Bounded Asynchronous Persistence Layer
 - Upon receiving a successful 2xx response from upstream:
-  - Dispatch the HTTP response bytes to the client immediately.
-  - Asynchronously persist the `canonical_hash`, `model`, `request_json`, and `response_json` into SQLite using `tokio::task::spawn_blocking`.
-  - Disk I/O must never block the client latency path.
+  - Transition in-flight state to `Ready` and broadcast bytes to awaiting followers.
+  - Asynchronously persist into SQLite WAL using `tokio::task::spawn_blocking` gated behind an `Arc<tokio::sync::Semaphore>` (4 concurrent permits, 250ms acquisition timeout).
+  - Configures `PRAGMA busy_timeout = 5000;` on all connections to handle lock contention.
+  - Leader awaits the write handle before evicting the in-flight memory entry.
 
 ---
 
@@ -115,9 +117,9 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 
 | ID | Category | Requirement Specification |
 | :--- | :--- | :--- |
-| **NFR-01** | **Latency SLA** | L1 cache hits must return with P99 latency $< 1.5\text{ms}$. L2 vector hits must return with P95 latency $< 15\text{ms}$. |
-| **NFR-02** | **Memory Safety** | Zero `.unwrap()`, `.expect()`, or explicit panics in production request paths. Memory leaks strictly prevented by RAII guards. |
-| **NFR-03** | **Storage Engine** | Embedded SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;`). Zero external DBMS dependencies. |
+| **NFR-01** | **Latency SLA** | L1 cache hits must return with P99 latency $< 1.5\text{ms}$. Coalesced followers receive responses $< 0.5\text{ms}$ after leader completion. |
+| **NFR-02** | **Memory Safety** | Zero `.unwrap()`, `.expect()`, or explicit panics in production request paths. Memory leaks strictly prevented by state-gated RAII guards. |
+| **NFR-03** | **Storage Engine** | Embedded SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;`). Zero external DBMS dependencies. |
 | **NFR-04** | **Concurrency** | The gateway must sustain a minimum of 5,000 concurrent client connections without connection pool exhaustion or socket starvation. |
 | **NFR-05** | **Zero Allocation** | Critical hot paths must utilize zero-copy `bytes::Bytes` slicing to minimize heap allocations during HTTP and disk shuttling. |
 | **NFR-06** | **Telemetry** | Every response must include diagnostic headers (`x-semcache-status`) and emit structured logs via `tracing`. |
@@ -129,53 +131,62 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 ```mermaid
 stateDiagram-v2
     [*] --> InboundRequest: POST /v1/chat/completions
-    InboundRequest --> Canonicalize: Parse JSON
-    Canonicalize --> ValidateStream: Check stream field
-    ValidateStream --> RejectStream: stream == true
-    RejectStream --> [*]: HTTP 400 Bad Request
+    InboundRequest --> CheckStream: Check stream parameter
     
-    ValidateStream --> StripVolatiles: stream == false / omitted
-    StripVolatiles --> HashBlake3: Sort keys & BLAKE3 hash
+    CheckStream --> StreamBypass: stream == true
+    StreamBypass --> ProxySSE: IdleTimeoutStream (180s TTFB, 30s chunk)
+    ProxySSE --> [*]: HTTP 200 (BYPASS_STREAM)
+    
+    CheckStream --> Canonicalize: stream == false / omitted
+    Canonicalize --> HashBlake3: Provider defaults + Multi-tenant salt
     HashBlake3 --> L1Lookup: Query exact_cache table
     
     L1Lookup --> ReturnL1Hit: Record found
     ReturnL1Hit --> [*]: HTTP 200 (HIT_L1)
     
     L1Lookup --> CheckCoalesce: L1 Miss
-    CheckCoalesce --> AwaitBroadcast: In-flight channel exists
+    CheckCoalesce --> AwaitBroadcast: In-flight channel exists (Pending)
     AwaitBroadcast --> ReturnCoalesced: Receive broadcast bytes
     ReturnCoalesced --> [*]: HTTP 200 (HIT_COALESCED)
+    
+    CheckCoalesce --> ImmediateMemoryHit: In-flight ready in RAM (Ready)
+    ImmediateMemoryHit --> [*]: HTTP 200 (HIT_COALESCED)
     
     CheckCoalesce --> RegisterLeader: Primary worker
     RegisterLeader --> UpstreamFetch: POST https://api.openai.com
     
     UpstreamFetch --> UpstreamError: HTTP 4xx / 5xx
-    UpstreamError --> DropLeader: Clean DashMap
+    UpstreamError --> DropLeader: Clean DashMap & Broadcast Error
     DropLeader --> [*]: Propagate Status Code
     
     UpstreamFetch --> UpstreamSuccess: HTTP 200 OK
-    UpstreamSuccess --> AsyncPersist: Spawn blocking SQLite write
-    UpstreamSuccess --> BroadcastLeader: Send to awaiting subscribers
-    BroadcastLeader --> [*]: HTTP 200 (MISS_UPSTREAM)
+    UpstreamSuccess --> MarkReadyAndBroadcast: InFlightState::Ready + Send to followers
+    MarkReadyAndBroadcast --> AsyncPersist: Bounded write semaphore (4 permits)
+    AsyncPersist --> EvictMemory: write_handle.await -> guard.evict()
+    EvictMemory --> [*]: HTTP 200 (MISS_UPSTREAM)
 ```
 
 ---
 
 ## 6. Release Roadmap
 
-- **Phase 1 (MVP - Completed):**
-  - Axum HTTP gateway engine.
-  - Canonicalization and volatile stripping.
-  - BLAKE3 L1 deterministic caching.
-  - SQLite WAL persistence and schema migrations.
-  - Single-flight concurrency coalescing.
-- **Phase 2 (Semantic Vector Expansion):**
-  - Native runtime linking of `sqlite-vec`.
-  - Local embedding generation via `fastembed-rs` (ONNX runtime) to eliminate external embedding API latency.
-  - Automated threshold calibration for Cosine distance metrics.
-- **Phase 3 (Streaming Interception):**
-  - Server-Sent Events (SSE) parser and chunk aggregator.
-  - Stream reconstruction for deterministic caching of streamed completions.
-- **Phase 4 (Enterprise Observability):**
-  - Prometheus metrics exporter (`/metrics`).
-  - Web-based administrative cache inspection dashboard.
+### Phase 1: SemCache v1.0.0 (Production Hardened - Shipped)
+- Axum HTTP gateway engine with zero unwrap / panic paths.
+- Syntax-preserving canonicalization and multi-tenant token salting.
+- Provider-aware default hyperparameter normalization (`OpenAi`, `Ollama`, `Generic`).
+- BLAKE3 L1 deterministic caching with SQLite WAL and `PRAGMA busy_timeout = 5000;`.
+- Sharded single-flight request coalescing with `Pending`/`Ready` states and state-gated RAII guards.
+- Transparent streaming bypass with dual-stage timeout watchdogs (`IdleTimeoutStream`).
+- Bounded 4-permit SQLite write semaphore with 250ms backpressure shedding.
+- 28-test comprehensive verification suite including sustained soak harness.
+
+### Phase 1.1: SemCache v1.1.0 Architectural Blueprint
+- **AST-Recursive Canonical Key Sorter:** Eliminate dependency on `serde_json` crate map ordering, guaranteeing mathematical lexicographical key determinism immune to Cargo workspace feature unification.
+- **30-Minute Continuous Production Soak Suite:** Dedicated long-horizon soak binary (`tests/long_soak.rs` behind `#[ignore]`) testing 100 sustained agents streaming multi-gigabyte context windows, evaluating WAL checkpoint performance and flat RSS stabilization.
+- **Transactional Disk-Commit Handoff:** Synchronize in-flight memory eviction directly with SQLite WAL commit signals to close any potential microsecond persistence race under heavy backpressure.
+
+### Phase 2: Semantic Vector Expansion (v2.0)
+- Native runtime linking of `sqlite-vec`.
+- Local embedding generation via `fastembed-rs` (ONNX runtime) to eliminate external embedding API latency.
+- Automated threshold calibration for Cosine distance metrics ($\ge 0.92$).
+- Full SSE chunk caching and stream reconstruction.
