@@ -41,11 +41,11 @@ pub fn embedding_to_bytes(embedding: &[f32]) -> Vec<u8> {
 
 /// Deserializes a byte slice from SQLite BLOB storage back into a Vec<f32>.
 pub fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Vec::new();
     }
     let mut embedding = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    for chunk in bytes.as_chunks::<4>().0 {
         let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         embedding.push(val);
     }

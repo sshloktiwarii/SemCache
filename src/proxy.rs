@@ -4,7 +4,13 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::Stream;
 use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::time::{sleep_until, Instant, Sleep};
 
 use crate::{
     canonical::canonicalize_and_hash,
@@ -21,15 +27,62 @@ pub struct AppState {
     pub upstream_url: String,
 }
 
-/// Core HTTP proxy gateway handler for OpenAI chat completions.
+/// A stream wrapper that enforces an idle timeout between consecutive chunks.
 ///
-/// Production Hardened:
-/// - Leader Cancellation Immunity: Upstream fetch is detached in tokio::spawn
-/// - Persistence Gap Closed: Memory buffer transitions to Ready until SQLite commits
-/// - Multi-Tenant Authorization Isolation: Auth token salted into BLAKE3
-/// - Syntax-Preserving Canonicalization: Indentation & newlines preserved
-/// - Zero Error Cache Poisoning: Only HTTP 200 persisted
-/// - Non-Blocking Streaming Bypass: Direct SSE streaming for stream: true
+/// CRITICAL FIX (The Guillotine Eradication):
+/// As long as chunks are actively received within `timeout_duration`, the stream
+/// can run indefinitely (supporting reasoning models and multi-megabyte code streams).
+/// If the upstream goes silent for `timeout_duration`, the stream terminates cleanly.
+pub struct IdleTimeoutStream<S> {
+    inner: S,
+    timeout_duration: Duration,
+    sleep: Pin<Box<Sleep>>,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    pub fn new(inner: S, timeout_duration: Duration) -> Self {
+        let sleep = Box::pin(sleep_until(Instant::now() + timeout_duration));
+        Self {
+            inner,
+            timeout_duration,
+            sleep,
+        }
+    }
+}
+
+impl<S, T, E> Stream for IdleTimeoutStream<S>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type Item = Result<T, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(item))) => {
+                let new_deadline = Instant::now() + self.timeout_duration;
+                self.sleep.as_mut().reset(new_deadline);
+                Poll::Ready(Some(Ok(item)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(std::io::Error::other(e))))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if self.sleep.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "Upstream chunk idle timeout: 30s elapsed with zero bytes",
+                    ))))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+/// Core HTTP proxy gateway handler for OpenAI chat completions.
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -41,12 +94,12 @@ pub async fn handle_chat_completion(
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok());
 
-    // Step 1: Canonicalization & BLAKE3 Hashing (with tenant isolation)
+    // Step 1: Canonicalization & BLAKE3 Hashing (with tenant isolation & default normalization)
     let canonical_res = canonicalize_and_hash(&payload_bytes, auth_str)?;
     let hash = canonical_res.hash;
     let canonical_val = canonical_res.canonical_value;
 
-    // Step 1.1: Non-Blocking Streaming Bypass
+    // Step 1.1: Non-Blocking Streaming Bypass with Per-Chunk Idle Timeout
     if canonical_res.is_streaming {
         let mut req_builder = state
             .http_client
@@ -66,13 +119,14 @@ pub async fn handle_chat_completion(
             return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
         }
 
-        let stream_body = Body::from_stream(upstream_resp.bytes_stream());
-        return Ok(Response::builder()
+        let idle_stream = IdleTimeoutStream::new(upstream_resp.bytes_stream(), Duration::from_secs(30));
+        let stream_body = Body::from_stream(idle_stream);
+        return Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header("x-semcache-status", "BYPASS_STREAM")
             .body(stream_body)
-            .map_err(|e| SemCacheError::InternalError(e.to_string()))?);
+            .map_err(|e| SemCacheError::InternalError(e.to_string()));
     }
 
     // Step 2: L1 Exact Match Cache Lookup
@@ -115,10 +169,16 @@ pub async fn handle_chat_completion(
             let payload_bytes_clone = payload_bytes.clone();
             let canonical_val_clone = canonical_val.clone();
 
-            // CRITICAL FIX (Leader Cancellation Immunity):
-            // Spawn the upstream fetch in a detached task. If this specific client disconnects,
-            // the background fetch continues, completes, persists to SQLite, and serves all followers.
             tokio::spawn(async move {
+                // CRITICAL FIX (Ghost Tasks):
+                // If the initiating client disconnected before upstream dispatch and no followers joined,
+                // abort immediately to avoid burning upstream OpenAI tokens!
+                if !guard.has_active_listeners() {
+                    tracing::info!("Ghost task aborted: 0 active listeners before upstream fetch.");
+                    guard.evict();
+                    return;
+                }
+
                 let mut req_builder = http_client
                     .post(&upstream_url)
                     .header(header::CONTENT_TYPE, "application/json");
@@ -150,10 +210,10 @@ pub async fn handle_chat_completion(
                     return;
                 }
 
-                // 1. Mark state in InFlightMap as Ready(bytes) & broadcast to current subscribers
+                // 1. Mark state in InFlightMap as Ready(bytes, timestamp) & broadcast to current subscribers
                 guard.mark_ready_and_broadcast(resp_bytes.clone());
 
-                // 2. Persist to SQLite WAL asynchronously
+                // 2. Persist to SQLite WAL with strict 5-second timeout safety
                 let model = canonical_val_clone
                     .get("model")
                     .and_then(|m| m.as_str())
@@ -162,20 +222,25 @@ pub async fn handle_chat_completion(
                 let req_json_str = canonical_val_clone.to_string();
                 let resp_json_str = String::from_utf8_lossy(&resp_bytes).into_owned();
 
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = insert_exact_cache(
-                        &db_pool,
-                        &hash,
-                        &model,
-                        &req_json_str,
-                        &resp_json_str,
-                    ) {
-                        tracing::error!("Failed to persist exact cache record: {}", e);
-                    }
-                })
+                let write_res = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::task::spawn_blocking(move || {
+                        insert_exact_cache(
+                            &db_pool,
+                            &hash,
+                            &model,
+                            &req_json_str,
+                            &resp_json_str,
+                        )
+                    }),
+                )
                 .await;
 
-                // 3. Evict from memory once SQLite write commits
+                if write_res.is_err() {
+                    tracing::error!("SQLite write timed out after 5s; evicting from memory to prevent leak.");
+                }
+
+                // 3. Evict from memory once SQLite write commits or times out
                 guard.evict();
             });
 
@@ -183,7 +248,6 @@ pub async fn handle_chat_completion(
         }
     };
 
-    // Await response from the detached worker
     let resp_bytes = match rx.recv().await {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(err)) => return Err((*err).clone()),
