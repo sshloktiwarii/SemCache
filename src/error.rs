@@ -20,9 +20,11 @@ pub enum SemCacheError {
     #[error("JSON serialization/deserialization error: {0}")]
     JsonError(String),
 
-    #[allow(dead_code)]
-    #[error("Streaming requests (stream: true) are not supported in MVP")]
-    StreamingNotSupported,
+    #[error("Request payload too large: {0}")]
+    PayloadTooLarge(String),
+
+    #[error("Upstream concurrency limit exceeded: {0}")]
+    ConcurrencyLimitExceeded(String),
 
     #[error("Upstream provider returned status {0}: {1}")]
     UpstreamError(u16, String),
@@ -58,7 +60,8 @@ impl From<serde_json::Error> for SemCacheError {
 impl IntoResponse for SemCacheError {
     fn into_response(self) -> Response {
         let (status, error_type) = match &self {
-            SemCacheError::StreamingNotSupported => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            SemCacheError::PayloadTooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
+            SemCacheError::ConcurrencyLimitExceeded(_) => (StatusCode::TOO_MANY_REQUESTS, "concurrency_limit_exceeded"),
             SemCacheError::UpstreamError(code, _) => {
                 let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_GATEWAY);
                 (status, "upstream_error")

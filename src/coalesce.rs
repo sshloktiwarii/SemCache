@@ -183,6 +183,22 @@ impl RequestCoalescer {
             }
         }
     }
+
+    /// Periodically cleans stale Ready entries older than `ttl` from InFlightMap.
+    /// This prevents unrequested completed responses from leaking memory.
+    pub fn sweep_stale_ready(&self, ttl: Duration) -> usize {
+        let mut swept = 0;
+        self.in_flight.retain(|_hash, state| {
+            if let CoalesceState::Ready(_, timestamp) = state {
+                if timestamp.elapsed() >= ttl {
+                    swept += 1;
+                    return false;
+                }
+            }
+            true
+        });
+        swept
+    }
 }
 
 #[cfg(test)]
@@ -321,5 +337,25 @@ mod tests {
         assert!(!guard.has_active_listeners(), "With zero listeners, task is detected as ghost");
 
         guard.evict();
+    }
+
+    #[tokio::test]
+    async fn test_sweep_stale_ready() {
+        let coalescer = RequestCoalescer::new();
+        let hash = [77u8; 32];
+
+        let primary_res = coalescer.register_or_wait(hash).await.unwrap();
+        let (mut guard, _rx) = match primary_res {
+            CoalesceResult::Primary(g, rx) => (g, rx),
+            _ => panic!("Expected primary worker"),
+        };
+
+        guard.mark_ready_and_broadcast(Bytes::from_static(b"{\"ok\":true}"));
+        assert_eq!(coalescer.in_flight.len(), 1);
+
+        // Sweep with 0 duration should immediately purge the ready entry
+        let swept = coalescer.sweep_stale_ready(Duration::from_millis(0));
+        assert_eq!(swept, 1);
+        assert_eq!(coalescer.in_flight.len(), 0);
     }
 }

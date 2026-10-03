@@ -28,7 +28,12 @@ pub struct AppState {
     pub coalescer: RequestCoalescer,
     pub upstream_url: String,
     pub sqlite_write_semaphore: Arc<Semaphore>,
+    pub upstream_semaphore: Arc<Semaphore>,
     pub default_provider: Provider,
+    pub default_tenant_id: String,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub cancel_orphan_requests: bool,
 }
 
 /// A stream wrapper that enforces a dual-stage timeout:
@@ -100,6 +105,17 @@ where
     }
 }
 
+/// Health and readiness probe handler.
+pub async fn handle_healthz() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+        ],
+        "{\"status\":\"ok\",\"service\":\"semcache\"}",
+    )
+}
+
 /// Core HTTP proxy gateway handler for LLM chat completions.
 pub async fn handle_chat_completion(
     State(state): State<AppState>,
@@ -108,27 +124,42 @@ pub async fn handle_chat_completion(
 ) -> Result<Response, SemCacheError> {
     let payload_bytes = serde_json::to_vec(&payload)?;
 
+    // Enforce maximum inbound request body size
+    if payload_bytes.len() > state.max_request_bytes {
+        return Err(SemCacheError::PayloadTooLarge(format!(
+            "Request payload of {} bytes exceeds configured limit of {} bytes",
+            payload_bytes.len(),
+            state.max_request_bytes
+        )));
+    }
+
+    // Salt across all credential headers (Authorization, api-key, x-api-key)
+    // If no credential header is provided, namespace under server default tenant ID.
     let auth_str = headers
         .get(header::AUTHORIZATION)
+        .or_else(|| headers.get("api-key"))
+        .or_else(|| headers.get("x-api-key"))
         .and_then(|h| h.to_str().ok());
 
-    // Step 1: Detect Provider & Canonicalize & BLAKE3 Hash
-    let provider = headers
-        .get("x-semcache-provider")
-        .and_then(|h| h.to_str().ok())
-        .map(|p| match p.to_ascii_lowercase().trim() {
-            "ollama" => Provider::Ollama,
-            "generic" | "raw" => Provider::Generic,
-            _ => Provider::OpenAi,
-        })
-        .unwrap_or(state.default_provider);
+    let tenant_salt = auth_str.unwrap_or(&state.default_tenant_id);
 
-    let canonical_res = canonicalize_and_hash(&payload_bytes, auth_str, provider)?;
+    // Server-side provider configuration is authoritative (eliminating client header spoofing)
+    let provider = state.default_provider;
+
+    let canonical_res = canonicalize_and_hash(&payload_bytes, Some(tenant_salt), provider)?;
     let hash = canonical_res.hash;
     let canonical_val = canonical_res.canonical_value;
 
-    // Step 1.1: Non-Blocking Streaming Bypass with Dual-Stage TTFB/Inter-Chunk Timeout
+    // Step 1: Non-Blocking Streaming Bypass with Dual-Stage TTFB/Inter-Chunk Timeout
     if canonical_res.is_streaming {
+        let _upstream_permit = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.upstream_semaphore.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| SemCacheError::ConcurrencyLimitExceeded("Gateway upstream concurrency saturated".into()))?
+        .map_err(|e| SemCacheError::InternalError(format!("Semaphore acquire error: {e}")))?;
+
         let mut req_builder = state
             .http_client
             .post(&state.upstream_url)
@@ -136,6 +167,12 @@ pub async fn handle_chat_completion(
 
         if let Some(auth_val) = headers.get(header::AUTHORIZATION) {
             req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
+        }
+        if let Some(key_val) = headers.get("api-key") {
+            req_builder = req_builder.header("api-key", key_val);
+        }
+        if let Some(x_key_val) = headers.get("x-api-key") {
+            req_builder = req_builder.header("x-api-key", x_key_val);
         }
 
         let upstream_resp = req_builder.body(payload_bytes).send().await?;
@@ -147,7 +184,6 @@ pub async fn handle_chat_completion(
             return Err(SemCacheError::UpstreamError(status.as_u16(), err_msg));
         }
 
-        // Dual timeout: 180s for TTFB (reasoning models), 30s inter-chunk watchdog
         let idle_stream = IdleTimeoutStream::new(
             upstream_resp.bytes_stream(),
             Duration::from_secs(180),
@@ -162,11 +198,19 @@ pub async fn handle_chat_completion(
             .map_err(|e| SemCacheError::InternalError(e.to_string()));
     }
 
-    // Step 2: L1 Exact Match Cache Lookup
+    // Step 2: L1 Exact Match Cache Lookup (with Fail-Open Degradation on SQLite Read Error)
     let pool_clone = state.db.clone();
-    let l1_hit = tokio::task::spawn_blocking(move || get_exact_cache(&pool_clone, &hash))
-        .await
-        .map_err(|e| SemCacheError::InternalError(format!("Task spawn error: {e}")))??;
+    let l1_hit = match tokio::task::spawn_blocking(move || get_exact_cache(&pool_clone, &hash)).await {
+        Ok(Ok(cached)) => cached,
+        Ok(Err(e)) => {
+            tracing::warn!("SQLite L1 read error (degrading to cache miss): {}", e);
+            None
+        }
+        Err(e) => {
+            tracing::warn!("SQLite read task error (degrading to cache miss): {}", e);
+            None
+        }
+    };
 
     if let Some(cached_json) = l1_hit {
         return Ok((
@@ -197,21 +241,39 @@ pub async fn handle_chat_completion(
             let http_client = state.http_client.clone();
             let upstream_url = state.upstream_url.clone();
             let db_pool = state.db.clone();
-            let auth_header_opt = auth_str.map(|s| s.to_string());
+            let auth_header_opt = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+            let api_key_opt = headers.get("api-key").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+            let x_api_key_opt = headers.get("x-api-key").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
             let payload_bytes_clone = payload_bytes.clone();
             let canonical_val_clone = canonical_val.clone();
             let write_semaphore = state.sqlite_write_semaphore.clone();
+            let upstream_semaphore = state.upstream_semaphore.clone();
+            let max_response_bytes = state.max_response_bytes;
+            let cancel_orphan_requests = state.cancel_orphan_requests;
 
             tokio::spawn(async move {
-                // CRITICAL FIX (Ghost Tasks without t=0 race):
-                // The leader is subscribed atomically upon creation.
-                // If the initiating client disconnected before upstream dispatch,
-                // `leader_rx` was dropped by Axum, making `receiver_count() == 0`.
-                if !guard.has_active_listeners() {
+                // Post-Dispatch Ghost Task Policy:
+                // If the initiating client dropped connection before upstream dispatch and zero followers wait,
+                // abort to save tokens if cancel_orphan_requests is enabled.
+                if cancel_orphan_requests && !guard.has_active_listeners() {
                     tracing::info!("Ghost task aborted: 0 active listeners before upstream fetch.");
                     guard.evict();
                     return;
                 }
+
+                // Acquire upstream concurrency permit
+                let _upstream_permit = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    upstream_semaphore.acquire_owned(),
+                ).await {
+                    Ok(Ok(permit)) => permit,
+                    _ => {
+                        guard.broadcast_error(SemCacheError::ConcurrencyLimitExceeded(
+                            "Gateway upstream concurrency saturated".into(),
+                        ));
+                        return;
+                    }
+                };
 
                 let mut req_builder = http_client
                     .post(&upstream_url)
@@ -219,6 +281,12 @@ pub async fn handle_chat_completion(
 
                 if let Some(auth_val) = auth_header_opt {
                     req_builder = req_builder.header(header::AUTHORIZATION, auth_val);
+                }
+                if let Some(key_val) = api_key_opt {
+                    req_builder = req_builder.header("api-key", key_val);
+                }
+                if let Some(x_key_val) = x_api_key_opt {
+                    req_builder = req_builder.header("x-api-key", x_key_val);
                 }
 
                 let upstream_resp = match req_builder.body(payload_bytes_clone).send().await {
@@ -244,10 +312,22 @@ pub async fn handle_chat_completion(
                     return;
                 }
 
+                // If response exceeds max_response_bytes, do not hold in Ready RAM or cache in SQLite
+                if resp_bytes.len() > max_response_bytes {
+                    tracing::warn!(
+                        "Response size ({} bytes) exceeds limit ({} bytes); bypassing cache storage",
+                        resp_bytes.len(),
+                        max_response_bytes
+                    );
+                    let _ = guard.tx.send(Ok(resp_bytes));
+                    guard.evict();
+                    return;
+                }
+
                 // 1. Mark state in InFlightMap as Ready(bytes, timestamp) & broadcast to current subscribers
                 guard.mark_ready_and_broadcast(resp_bytes.clone());
 
-                // 2. Persist to SQLite WAL with strict semaphore backpressure to prevent Tokio threadpool exhaustion!
+                // 2. Persist to SQLite WAL with bounded semaphore backpressure
                 let model = canonical_val_clone
                     .get("model")
                     .and_then(|m| m.as_str())
@@ -256,7 +336,6 @@ pub async fn handle_chat_completion(
                 let req_json_str = canonical_val_clone.to_string();
                 let resp_json_str = String::from_utf8_lossy(&resp_bytes).into_owned();
 
-                // Acquire write permit under backpressure (bounded wait of 250ms)
                 let permit_res = tokio::time::timeout(
                     Duration::from_millis(250),
                     write_semaphore.acquire_owned(),
@@ -265,9 +344,8 @@ pub async fn handle_chat_completion(
 
                 match permit_res {
                     Ok(Ok(permit)) => {
-                        // Bounded concurrency guaranteed: at most N blocking threads ever run concurrently
                         let write_handle = tokio::task::spawn_blocking(move || {
-                            let _permit = permit; // Held until SQLite disk write commits or fails
+                            let _permit = permit;
                             insert_exact_cache(
                                 &db_pool,
                                 &hash,
@@ -276,15 +354,26 @@ pub async fn handle_chat_completion(
                                 &resp_json_str,
                             )
                         });
-                        let _ = write_handle.await;
+
+                        match write_handle.await {
+                            Ok(Ok(())) => {
+                                // SQLite write committed successfully: safe to evict from memory
+                                guard.evict();
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("SQLite write failed: {}; retaining entry in Ready RAM cache for TTL", e);
+                                // DO NOT evict immediately; retain in Ready RAM cache so subsequent callers don't duplicate upstream!
+                            }
+                            Err(e) => {
+                                tracing::warn!("SQLite write task error: {}; retaining entry in Ready RAM cache for TTL", e);
+                            }
+                        }
                     }
                     _ => {
-                        tracing::warn!("SQLite write backpressure saturated; dropping async disk write to protect threadpool");
+                        tracing::warn!("SQLite write backpressure saturated; dropping async disk write; retaining entry in Ready RAM cache for TTL");
+                        // DO NOT evict immediately; retain in Ready RAM cache so immediate retries hit RAM!
                     }
                 }
-
-                // 3. Evict from memory once SQLite write commits or is skipped under backpressure
-                guard.evict();
             });
 
             (leader_rx, true)

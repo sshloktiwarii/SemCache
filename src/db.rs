@@ -170,7 +170,12 @@ pub fn prune_expired_records(pool: &DbPool, max_age_days: i64) -> Result<usize, 
         [&modifier],
     )?;
 
-    Ok(deleted_exact + deleted_fuzzy)
+    let total_deleted = deleted_exact + deleted_fuzzy;
+
+    // Execute WAL checkpoint to reclaim pages and truncate log file to avoid unbound growth
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
+    Ok(total_deleted)
 }
 
 #[cfg(test)]

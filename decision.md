@@ -21,6 +21,10 @@
 - [ADR 012: Provider-Aware Default Hyperparameter Normalization](#adr-012-provider-aware-default-hyperparameter-normalization)
 - [ADR 013: State-Gated In-Flight RAII Guard Lifecycle](#adr-013-state-gated-in-flight-raii-guard-lifecycle)
 - [ADR 014: SemCache v1.1 Architectural Blueprint](#adr-014-semcache-v11-architectural-blueprint)
+- [ADR 015: In-Code Recursive AST Key Sorting for Feature Unification Immunity](#adr-015-in-code-recursive-ast-key-sorting-for-feature-unification-immunity)
+- [ADR 016: Multi-Header Credential Salting and Unauthenticated Namespace Isolation](#adr-016-multi-header-credential-salting-and-unauthenticated-namespace-isolation)
+- [ADR 017: Fail-Open SQLite Storage Degradation](#adr-017-fail-open-sqlite-storage-degradation)
+- [ADR 018: Gateway Memory, Payload Size, and Concurrency Bounds](#adr-018-gateway-memory-payload-size-and-concurrency-bounds)
 
 ---
 
@@ -364,4 +368,85 @@ Construct a dedicated soak test bin (`cargo test --test long_soak -- --ignored`)
 - Simulates realistic 8k to 32k context-window payloads.
 - Periodically triggers SQLite WAL manual checkpoints (`PRAGMA wal_checkpoint(TRUNCATE)`).
 - Validates flat resident memory (RSS $\Delta \approx 0$).
+
+---
+
+## ADR 015: In-Code Recursive AST Key Sorting for Feature Unification Immunity
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+In Cargo workspaces, features are unified across all crates. Setting `default-features = false` on `serde_json` does not prevent another dependency from enabling `preserve_order`. If enabled, `serde_json::Map` shifts from `BTreeMap` to `IndexMap`, changing key serialization order and silently destroying BLAKE3 cache hit rates.
+
+### Decision
+Implement `serialize_canonical_strict` in `src/canonical.rs` to recursively traverse the AST and sort all object keys lexicographically in code before computing the BLAKE3 digest.
+
+### Consequences
+**Positive:**
+- Mathematical key-order determinism is guaranteed regardless of Cargo build graph features.
+- Eliminates silent cache divergence.
+
+---
+
+## ADR 016: Multi-Header Credential Salting and Unauthenticated Namespace Isolation
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+AI client libraries use varying authentication headers: `Authorization` (OpenAI), `api-key` (Azure OpenAI), or `x-api-key` (Anthropic/LiteLLM). Furthermore, local LLMs (Ollama, vLLM) often run without authentication. If only `Authorization` is salted, Azure/Anthropic users collapse into `anonymous`, and local LLM users share one unpartitioned cache.
+
+### Decision
+1. Salt across all three headers: `Authorization`, `api-key`, and `x-api-key`.
+2. For unauthenticated requests, namespace under a server-configured `SEMCACHE_TENANT_ID` (default `default_tenant`).
+3. Strip all credential headers from stored request JSON in SQLite.
+
+### Consequences
+**Positive:**
+- Multi-cloud compatibility across OpenAI, Azure, and Anthropic clients.
+- Isolated namespaces for local LLM clusters.
+- Zero credential leakage into database storage or telemetry.
+
+---
+
+## ADR 017: Fail-Open SQLite Storage Degradation
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+SemCache is an accelerating gateway, not an authoritative datastore. If SQLite encounters disk lock timeouts, table corruption, or I/O failure, failing the client's HTTP request destroys upstream reliability.
+
+### Decision
+1. If SQLite L1 read fails, log a warning and degrade gracefully to a cache miss (`None`), continuing to upstream.
+2. If SQLite L1 write fails, log a warning, preserve the response in RAM `Ready` state for 10 seconds, and return the HTTP 200 response to the client.
+
+### Consequences
+**Positive:**
+- Upstream proxy availability is preserved even under catastrophic database failure.
+- Temporary storage degradation does not cause 500 errors to client applications.
+
+---
+
+## ADR 018: Gateway Memory, Payload Size, and Concurrency Bounds
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Unbounded request bodies, multi-hundred-megabyte responses, and unconstrained upstream dispatches expose the gateway to Out-Of-Memory (OOM) crashes and threadpool starvation.
+
+### Decision
+1. Enforce `SEMCACHE_MAX_REQUEST_BYTES` (default 10 MB); reject oversized requests with HTTP 413.
+2. Enforce `SEMCACHE_MAX_RESPONSE_BYTES` (default 10 MB); oversized responses bypass in-memory caching and stream directly.
+3. Gate upstream dispatch behind `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` semaphore (default 256).
+4. Run periodic background sweeps in `RequestCoalescer` every 10 seconds to purge expired `Ready` entries.
+5. Default server binding to `127.0.0.1:3000` to prevent accidental network exposure.
+
+### Consequences
+**Positive:**
+- Strictly bounded memory footprint and threadpool allocation.
+- Protection against denial-of-service via huge payloads.
+
 

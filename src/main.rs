@@ -1,4 +1,4 @@
-use axum::{routing::post, Router};
+use axum::{routing::{get, post}, Router};
 use std::time::Duration;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -6,7 +6,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use semcache::{
     coalesce::RequestCoalescer,
     db::{init_db_pool, prune_expired_records},
-    proxy::{handle_chat_completion, AppState},
+    proxy::{handle_chat_completion, handle_healthz, AppState},
 };
 
 #[tokio::main]
@@ -22,15 +22,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = std::env::var("SEMCACHE_DB_PATH").unwrap_or_else(|_| "semcache.db".to_string());
     let upstream_url = std::env::var("OPENAI_UPSTREAM_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".to_string());
-    let bind_addr = std::env::var("SEMCACHE_BIND").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    
+    // Default bind to loopback address (127.0.0.1:3000) for security
+    let bind_addr = std::env::var("SEMCACHE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let ttl_days: i64 = std::env::var("SEMCACHE_TTL_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
     
-    // CRITICAL FIX (The 60-Second Guillotine):
-    // Reasoning models (e.g. o1-preview) and large code generation streams routinely take 90+ seconds.
-    // Defaulting to 300s prevents premature connection severance.
+    let default_tenant_id = std::env::var("SEMCACHE_TENANT_ID")
+        .unwrap_or_else(|_| "default_tenant".to_string());
+
+    let max_request_bytes: usize = std::env::var("SEMCACHE_MAX_REQUEST_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10 * 1024 * 1024); // 10 MB default
+
+    let max_response_bytes: usize = std::env::var("SEMCACHE_MAX_RESPONSE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10 * 1024 * 1024); // 10 MB default
+
+    let max_upstream_concurrency: usize = std::env::var("SEMCACHE_MAX_UPSTREAM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let upstream_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_upstream_concurrency));
+
+    let cancel_orphan_requests = std::env::var("SEMCACHE_CANCEL_ORPHAN_REQUESTS")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+
     let upstream_timeout_secs: u64 = std::env::var("SEMCACHE_UPSTREAM_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -46,6 +68,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let coalescer = RequestCoalescer::new();
+
+    // Background sweep task for expired Ready entries in InFlightMap (every 10s)
+    let coalescer_sweep = coalescer.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let swept = coalescer_sweep.sweep_stale_ready(Duration::from_secs(10));
+            if swept > 0 {
+                tracing::debug!("Swept {} stale ready entries from InFlightMap", swept);
+            }
+        }
+    });
 
     // Background TTL pruning task running hourly
     let prune_pool = pool.clone();
@@ -91,11 +126,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         coalescer,
         upstream_url,
         sqlite_write_semaphore,
+        upstream_semaphore,
         default_provider,
+        default_tenant_id,
+        max_request_bytes,
+        max_response_bytes,
+        cancel_orphan_requests,
     };
 
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completion))
+        .route("/healthz", get(handle_healthz))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -110,5 +151,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received Ctrl+C (SIGINT); initiating graceful shutdown...");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM; initiating graceful shutdown...");
+        },
+    }
 }

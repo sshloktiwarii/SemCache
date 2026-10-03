@@ -281,10 +281,18 @@ SemCache enforces structured JSON errors compliant with OpenAI API specification
 
 | Environment Variable | Default Value | Description |
 | :--- | :--- | :--- |
-| `SEMCACHE_BIND` | `0.0.0.0:3000` | TCP socket address for the inbound HTTP gateway. |
-| `SEMCACHE_DB_PATH` | `semcache.db` | Filepath for the SQLite database. |
+| `SEMCACHE_BIND` | `127.0.0.1:3000` | Loopback TCP socket address for the inbound HTTP gateway. |
+| `SEMCACHE_DB_PATH` | `semcache.db` | Filepath for the SQLite persistence database. |
 | `OPENAI_UPSTREAM_URL` | `https://api.openai.com/v1/chat/completions` | Target upstream URL for forwarded chat requests. |
 | `SEMCACHE_DEFAULT_PROVIDER`| `openai` | Default provider profile for normalization (`openai`, `ollama`, `generic`). |
+| `SEMCACHE_TENANT_ID` | `default_tenant` | Fallback tenant identifier for unauthenticated endpoints. |
+| `SEMCACHE_MAX_REQUEST_BYTES` | `10485760` (10 MB) | Maximum accepted request payload size (returns HTTP 413 on breach). |
+| `SEMCACHE_MAX_RESPONSE_BYTES`| `10485760` (10 MB) | Maximum cached response size; larger responses bypass memory retention. |
+| `SEMCACHE_MAX_CONCURRENT_WRITES` | `4` | Concurrency limit on SQLite background writer tasks. |
+| `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` | `256` | Maximum concurrent upstream HTTP requests. |
+| `SEMCACHE_TTL_DAYS` | `7` | Cache entry retention window before automated pruning. |
+| `SEMCACHE_UPSTREAM_TIMEOUT_SECS` | `300` | Overall upstream HTTP connection timeout. |
+| `SEMCACHE_CANCEL_ORPHAN_REQUESTS` | `false` | Whether to cancel in-flight upstream fetch if initiator disconnects. |
 | `RUST_LOG` | `semcache=debug,axum=info` | Tracing log filter directive. |
 
 ---

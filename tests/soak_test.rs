@@ -54,6 +54,7 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
 
     let coalescer = RequestCoalescer::new();
     let sqlite_write_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+    let upstream_semaphore = Arc::new(tokio::sync::Semaphore::new(256));
 
     let state = AppState {
         db: pool.clone(),
@@ -61,7 +62,12 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         coalescer,
         upstream_url,
         sqlite_write_semaphore,
+        upstream_semaphore,
         default_provider: semcache::canonical::Provider::OpenAi,
+        default_tenant_id: "soak_tenant".to_string(),
+        max_request_bytes: 10 * 1024 * 1024,
+        max_response_bytes: 10 * 1024 * 1024,
+        cancel_orphan_requests: false,
     };
 
     let app = Router::new()

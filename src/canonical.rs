@@ -16,6 +16,14 @@ pub enum Provider {
 }
 
 impl Provider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Provider::OpenAi => "openai",
+            Provider::Ollama => "ollama",
+            Provider::Generic => "generic",
+        }
+    }
+
     /// Infers the LLM provider from an optional request header (e.g. `x-semcache-provider`)
     /// or from the target upstream URL.
     pub fn from_hint(header_val: Option<&str>, upstream_url: &str) -> Self {
@@ -27,10 +35,13 @@ impl Provider {
                 _ => {}
             }
         }
-        if upstream_url.contains("11434") || upstream_url.to_ascii_lowercase().contains("ollama") {
+        let url_lower = upstream_url.to_ascii_lowercase();
+        if url_lower.contains("11434") || url_lower.contains("ollama") {
             Provider::Ollama
-        } else {
+        } else if url_lower.contains("openai.com") || url_lower.contains("openai.azure.com") {
             Provider::OpenAi
+        } else {
+            Provider::Generic
         }
     }
 }
@@ -41,10 +52,51 @@ pub struct CanonicalResult {
     pub is_streaming: bool,
 }
 
+/// Recursively serializes a `serde_json::Value` with guaranteed lexicographical key ordering.
+///
+/// This provides mathematical immunity against Cargo workspace feature unification
+/// (e.g. if any transitive dependency in the build graph activates `serde_json/preserve_order`).
+pub fn serialize_canonical_strict(value: &Value, buffer: &mut Vec<u8>) {
+    match value {
+        Value::Object(map) => {
+            buffer.push(b'{');
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            // Explicit lexicographical sorting independent of Cargo features or BTreeMap vs IndexMap
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (idx, (k, v)) in entries.iter().enumerate() {
+                if idx > 0 {
+                    buffer.push(b',');
+                }
+                let _ = serde_json::to_writer(&mut *buffer, k);
+                buffer.push(b':');
+                serialize_canonical_strict(v, buffer);
+            }
+            buffer.push(b'}');
+        }
+        Value::Array(arr) => {
+            buffer.push(b'[');
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    buffer.push(b',');
+                }
+                serialize_canonical_strict(item, buffer);
+            }
+            buffer.push(b']');
+        }
+        primitive => {
+            let _ = serde_json::to_writer(&mut *buffer, primitive);
+        }
+    }
+}
+
 /// Canonicalizes an incoming JSON payload.
 ///
-/// CRITICAL FIX (Flaw #4 - Multi-Tenant Isolation):
-/// Incorporates `auth_header` into the BLAKE3 digest. Tenant A and Tenant B
+/// CRITICAL FIX (P0-1 - Provider Isolation):
+/// Incorporates `provider.as_str()` directly into the BLAKE3 digest (`|provider:<name>`).
+/// OpenAI and Ollama with identical prompts will NEVER collide.
+///
+/// CRITICAL FIX (P0-1 - Multi-Tenant Isolation):
+/// Incorporates `auth_salt` into the BLAKE3 digest. Tenant A and Tenant B
 /// will NEVER share cache entries.
 ///
 /// CRITICAL FIX (The Ollama Trap & Default-Key Hash Divergence):
@@ -53,11 +105,11 @@ pub struct CanonicalResult {
 /// - Ollama: Defaults to `temperature: 0.8`, `top_p: 0.9`. An explicit `temperature: 1.0` is NOT default!
 /// - Generic: No defaults are stripped; exact parameters are preserved verbatim.
 ///
-/// CRITICAL FIX (Flaw #3 - Syntax Preservation):
+/// CRITICAL FIX (Syntax Preservation & Multimodal Support):
 /// Preserves code blocks, Python indentation, YAML spacing, and Markdown line breaks verbatim.
 pub fn canonicalize_and_hash(
     payload_bytes: &[u8],
-    auth_header: Option<&str>,
+    auth_salt: Option<&str>,
     provider: Provider,
 ) -> Result<CanonicalResult, SemCacheError> {
     let mut value: Value = serde_json::from_slice(payload_bytes)?;
@@ -78,16 +130,29 @@ pub fn canonicalize_and_hash(
             map.remove(*key);
         }
 
-        // CRITICAL FIX: Provider-aware default normalization
+        // Provider-aware default normalization
         normalize_provider_defaults(map, provider);
 
         // Preserve internal whitespace/newlines verbatim; only trim outermost edges
         if let Some(Value::Array(messages)) = map.get_mut("messages") {
             for msg in messages {
                 if let Value::Object(msg_map) = msg {
-                    if let Some(Value::String(content)) = msg_map.get_mut("content") {
-                        let trimmed = content.trim().to_string();
-                        *content = trimmed;
+                    match msg_map.get_mut("content") {
+                        Some(Value::String(content)) => {
+                            let trimmed = content.trim().to_string();
+                            *content = trimmed;
+                        }
+                        Some(Value::Array(parts)) => {
+                            for part in parts {
+                                if let Value::Object(part_map) = part {
+                                    if let Some(Value::String(text)) = part_map.get_mut("text") {
+                                        let trimmed = text.trim().to_string();
+                                        *text = trimmed;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -99,16 +164,22 @@ pub fn canonicalize_and_hash(
         }
     }
 
-    let canonical_bytes = serde_json::to_vec(&value)?;
+    let mut canonical_bytes = Vec::new();
+    serialize_canonical_strict(&value, &mut canonical_bytes);
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(&canonical_bytes);
 
+    // Explicit Provider Isolation in Cache Digest
+    hasher.update(b"|provider:");
+    hasher.update(provider.as_str().as_bytes());
+
+    // Explicit Multi-Tenant Salting in Cache Digest
     hasher.update(b"|auth_tenant:");
-    if let Some(auth) = auth_header {
+    if let Some(auth) = auth_salt {
         hasher.update(auth.trim().as_bytes());
     } else {
-        hasher.update(b"anonymous");
+        hasher.update(b"default_tenant");
     }
 
     let hash = *hasher.finalize().as_bytes();
@@ -151,8 +222,7 @@ fn normalize_provider_defaults(map: &mut serde_json::Map<String, Value>, provide
         }
         Provider::Ollama => {
             // Ollama Defaults: temperature=0.8, top_p=0.9
-            // CRITICAL: In Ollama, temperature: 1.0 is NON-DEFAULT.
-            // Only temperature: 0.8 is removed to match omitted parameters.
+            // In Ollama, temperature: 1.0 is NON-DEFAULT.
             if let Some(temp) = map.get("temperature").and_then(|v| v.as_f64()) {
                 if (temp - 0.8).abs() < f64::EPSILON {
                     map.remove("temperature");
@@ -176,8 +246,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_provider_namespace_isolation() {
+        let payload = br#"{"model":"llama3","prompt":"Hello world"}"#;
+
+        let res_openai = canonicalize_and_hash(payload, Some("tenant-1"), Provider::OpenAi).unwrap();
+        let res_ollama = canonicalize_and_hash(payload, Some("tenant-1"), Provider::Ollama).unwrap();
+        let res_generic = canonicalize_and_hash(payload, Some("tenant-1"), Provider::Generic).unwrap();
+
+        assert_ne!(
+            res_openai.hash, res_ollama.hash,
+            "OpenAI and Ollama with identical request and tenant MUST produce different cache hashes"
+        );
+        assert_ne!(
+            res_ollama.hash, res_generic.hash,
+            "Ollama and Generic MUST produce different cache hashes"
+        );
+    }
+
+    #[test]
     fn test_openai_default_key_hash_convergence() {
-        // OpenAI: Request without temperature vs Request with default temperature 1.0
         let json_omitted = br#"{"model":"gpt-4o","prompt":"A"}"#;
         let json_explicit_default = br#"{"model":"gpt-4o","prompt":"A","temperature":1.0,"top_p":1.0,"presence_penalty":0.0}"#;
 
@@ -192,7 +279,6 @@ mod tests {
 
     #[test]
     fn test_ollama_provider_default_normalization() {
-        // In Ollama, default temperature is 0.8, NOT 1.0!
         let json_omitted = br#"{"model":"llama3","prompt":"A"}"#;
         let json_default_ollama = br#"{"model":"llama3","prompt":"A","temperature":0.8}"#;
         let json_explicit_one = br#"{"model":"llama3","prompt":"A","temperature":1.0}"#;
@@ -256,6 +342,25 @@ mod tests {
     }
 
     #[test]
+    fn test_multimodal_content_array_trimming() {
+        let payload = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "   Explain this code: \n    def f(): return 1   "},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+                ]
+            }],
+            "temperature": 0.0
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let res = canonicalize_and_hash(&bytes, Some("Bearer key-1"), Provider::OpenAi).unwrap();
+        let text_content = res.canonical_value["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text_content, "Explain this code: \n    def f(): return 1");
+    }
+
+    #[test]
     fn test_multi_tenant_auth_isolation() {
         let payload = br#"{"model":"gpt-4o","prompt":"Hello world"}"#;
 
@@ -263,5 +368,25 @@ mod tests {
         let res_tenant_b = canonicalize_and_hash(payload, Some("Bearer sk-tenant-b"), Provider::OpenAi).unwrap();
 
         assert_ne!(res_tenant_a.hash, res_tenant_b.hash);
+    }
+
+    #[test]
+    fn test_azure_openai_url_detection() {
+        assert_eq!(
+            Provider::from_hint(None, "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions"),
+            Provider::OpenAi
+        );
+        assert_eq!(
+            Provider::from_hint(None, "https://api.openai.com/v1/chat/completions"),
+            Provider::OpenAi
+        );
+        assert_eq!(
+            Provider::from_hint(None, "http://localhost:11434/api/chat"),
+            Provider::Ollama
+        );
+        assert_eq!(
+            Provider::from_hint(None, "http://vllm-service:8000/v1/chat/completions"),
+            Provider::Generic
+        );
     }
 }
