@@ -77,12 +77,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(4);
     let sqlite_write_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrent_writes));
 
+    let default_provider_str = std::env::var("SEMCACHE_DEFAULT_PROVIDER")
+        .unwrap_or_else(|_| "openai".to_string());
+    let default_provider = match default_provider_str.to_ascii_lowercase().trim() {
+        "ollama" => semcache::canonical::Provider::Ollama,
+        "generic" | "raw" => semcache::canonical::Provider::Generic,
+        _ => semcache::canonical::Provider::OpenAi,
+    };
+
     let state = AppState {
         db: pool,
         http_client,
         coalescer,
         upstream_url,
         sqlite_write_semaphore,
+        default_provider,
     };
 
     let app = Router::new()

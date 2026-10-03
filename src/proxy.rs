@@ -28,6 +28,7 @@ pub struct AppState {
     pub coalescer: RequestCoalescer,
     pub upstream_url: String,
     pub sqlite_write_semaphore: Arc<Semaphore>,
+    pub default_provider: Provider,
 }
 
 /// A stream wrapper that enforces a dual-stage timeout:
@@ -112,10 +113,15 @@ pub async fn handle_chat_completion(
         .and_then(|h| h.to_str().ok());
 
     // Step 1: Detect Provider & Canonicalize & BLAKE3 Hash
-    let provider_hint = headers
+    let provider = headers
         .get("x-semcache-provider")
-        .and_then(|h| h.to_str().ok());
-    let provider = Provider::from_hint(provider_hint, &state.upstream_url);
+        .and_then(|h| h.to_str().ok())
+        .map(|p| match p.to_ascii_lowercase().trim() {
+            "ollama" => Provider::Ollama,
+            "generic" | "raw" => Provider::Generic,
+            _ => Provider::OpenAi,
+        })
+        .unwrap_or(state.default_provider);
 
     let canonical_res = canonicalize_and_hash(&payload_bytes, auth_str, provider)?;
     let hash = canonical_res.hash;

@@ -69,9 +69,12 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
   - Consecutive newlines must be collapsed into a single newline boundary.
 - **Deterministic Serialization:** JSON keys must be serialized in strictly sorted lexicographical order prior to hashing.
 
-### FR-03: Streaming Request Rejection (MVP Scope)
-- If an incoming payload contains `stream: true`, the gateway must reject the request with HTTP 400 Bad Request and error code `StreamingNotSupported`.
-- *Rationale:* Unary JSON caching is prioritized for the deterministic MVP. Streaming response chunk aggregation is scheduled for Phase 3.
+### FR-03: Non-Blocking Streaming Bypass (MVP Scope)
+- If an incoming payload contains `stream: true`, the gateway bypasses caching and transparently proxies the stream to the upstream LLM endpoint.
+- **Dual-Stage Timeout Watchdog:** The stream is wrapped in `IdleTimeoutStream`, enforcing:
+  1. A 180-second Time-To-First-Byte (TTFB) timeout to accommodate reasoning models (`o1`, `o3-mini`, `deepseek-r1`) during extended thinking phases.
+  2. A 30-second inter-chunk idle watchdog once token streaming commences.
+- Responses are tagged with header `x-semcache-status: BYPASS_STREAM`. Full SSE chunk caching is deferred to v2.0.
 
 ### FR-04: L1 Exact-Match Deterministic Caching
 - Compute a 32-byte BLAKE3 hash over the canonicalized JSON bytes.
@@ -87,7 +90,8 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 - **If no in-flight request exists:** The worker becomes the Primary Leader, registers a broadcast channel in the map, proceeds to upstream execution, and broadcasts the completed payload to all waiting clients upon arrival.
 - **Guaranteed Cleanup:** If the Primary Leader encounters an error or drops unexpectedly, RAII guards must ensure the hash is purged from the `DashMap` to prevent subscriber deadlocks.
 
-### FR-06: L2 Semantic Vector-Similarity Caching (Phase 2 Integration)
+### FR-06: [Phase 2 / Not Shipped] Semantic Vector Search (L2)
+- *MVP Scope Note:* MVP ships with exact-match L1 and coalescing. Native L2 embedding generation via `fastembed-rs` and indexed `sqlite-vec` lookups are deferred to v2.0.
 - If L1 exact match misses, generate an embedding vector for the prompt text (default: 1536-dimensional float vector matching `text-embedding-3-small`).
 - Query the virtual table `fuzzy_cache` using `sqlite-vec`.
 - Evaluate Cosine distance: if $\text{distance} \le 0.08$ (Cosine similarity $\ge 0.92$), return the cached response with `x-semcache-status: HIT_L2`.

@@ -40,6 +40,7 @@ fn create_test_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         coalescer,
         upstream_url,
         sqlite_write_semaphore,
+        default_provider: semcache::canonical::Provider::OpenAi,
     };
 
     let app = Router::new()
@@ -367,7 +368,7 @@ async fn test_ghost_task_aborted_when_initiator_disconnects() {
     let coalescer = semcache::coalesce::RequestCoalescer::new();
     let hash = [77u8; 32];
 
-    let (guard, leader_rx) = match coalescer.register_or_wait(hash).await.unwrap() {
+    let (mut guard, leader_rx) = match coalescer.register_or_wait(hash).await.unwrap() {
         semcache::coalesce::CoalesceResult::Primary(g, rx) => (g, rx),
         _ => panic!("Expected primary worker"),
     };

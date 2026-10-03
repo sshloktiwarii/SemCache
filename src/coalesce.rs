@@ -20,6 +20,13 @@ pub struct RequestCoalescer {
     pub in_flight: InFlightMap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardState {
+    Pending,
+    Ready,
+    Evicted,
+}
+
 #[derive(Debug)]
 pub enum CoalesceResult {
     /// The caller is the primary/leader worker responsible for fetching upstream.
@@ -33,6 +40,7 @@ pub struct LeaderGuard {
     pub hash: [u8; 32],
     pub in_flight: InFlightMap,
     pub tx: broadcast::Sender<InFlightPayload>,
+    pub state: GuardState,
     pub completed: bool,
 }
 
@@ -40,6 +48,7 @@ impl std::fmt::Debug for LeaderGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LeaderGuard")
             .field("hash", &self.hash)
+            .field("state", &self.state)
             .field("completed", &self.completed)
             .finish()
     }
@@ -52,13 +61,15 @@ impl LeaderGuard {
     /// Storing a monotonic timestamp guarantees that memory entries are bounded and
     /// can be automatically evicted if SQLite writes hang or fail.
     pub fn mark_ready_and_broadcast(&mut self, data: Bytes) {
+        self.state = GuardState::Ready;
         self.completed = true;
         self.in_flight.insert(self.hash, CoalesceState::Ready(data.clone(), Instant::now()));
         let _ = self.tx.send(Ok(data));
     }
 
     /// Evicts the hash entry from InFlightMap after SQLite persistence commits.
-    pub fn evict(&self) {
+    pub fn evict(&mut self) {
+        self.state = GuardState::Evicted;
         self.in_flight.remove(&self.hash);
     }
 
@@ -74,6 +85,7 @@ impl LeaderGuard {
 
     /// Broadcasts upstream failure to all waiting followers.
     pub fn broadcast_error(mut self, err: SemCacheError) {
+        self.state = GuardState::Evicted;
         self.completed = true;
         self.in_flight.remove(&self.hash);
         let _ = self.tx.send(Err(Arc::new(err)));
@@ -82,12 +94,13 @@ impl LeaderGuard {
 
 impl Drop for LeaderGuard {
     fn drop(&mut self) {
-        if !self.completed {
-            self.in_flight.remove(&self.hash);
+        if self.state == GuardState::Pending {
+            // Only broadcast error and remove if it was abandoned mid-flight
             let _ = self.tx.send(Err(Arc::new(SemCacheError::UpstreamError(
-                502,
-                "In-flight primary worker terminated without completing response".to_string(),
+                500,
+                "Leader aborted".to_string(),
             ))));
+            self.in_flight.remove(&self.hash);
         }
     }
 }
@@ -125,6 +138,7 @@ impl RequestCoalescer {
                                         hash,
                                         in_flight: self.in_flight.clone(),
                                         tx,
+                                        state: GuardState::Pending,
                                         completed: false,
                                     },
                                     leader_rx,
@@ -144,6 +158,7 @@ impl RequestCoalescer {
                             hash,
                             in_flight: self.in_flight.clone(),
                             tx,
+                            state: GuardState::Pending,
                             completed: false,
                         },
                         leader_rx,
@@ -270,10 +285,10 @@ mod tests {
         let follower_res = follower_handle.await.unwrap();
         match follower_res {
             Err(SemCacheError::UpstreamError(code, msg)) => {
-                assert_eq!(code, 502);
-                assert!(msg.contains("terminated without completing response"));
+                assert_eq!(code, 500);
+                assert!(msg.contains("Leader aborted"));
             }
-            other => panic!("Expected 502 error from dropped guard, got: {:?}", other),
+            other => panic!("Expected 500 error from dropped guard, got: {:?}", other),
         }
 
         assert!(!coalescer.in_flight.contains_key(&hash));
@@ -285,7 +300,7 @@ mod tests {
         let hash = [88u8; 32];
 
         let primary_res = coalescer.register_or_wait(hash).await.unwrap();
-        let (guard, leader_rx) = match primary_res {
+        let (mut guard, leader_rx) = match primary_res {
             CoalesceResult::Primary(g, rx) => (g, rx),
             _ => panic!("Expected primary worker"),
         };
@@ -304,5 +319,7 @@ mod tests {
         // Follower disconnects:
         drop(follower_sub);
         assert!(!guard.has_active_listeners(), "With zero listeners, task is detected as ghost");
+
+        guard.evict();
     }
 }

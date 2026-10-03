@@ -13,7 +13,8 @@ pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA temp_store = MEMORY;",
+             PRAGMA temp_store = MEMORY;
+             PRAGMA busy_timeout = 5000;",
         )
     });
 
