@@ -86,9 +86,9 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 | `HIT_COALESCED` | Subscribed to a concurrent in-flight leader or retrieved from `Ready` memory. |
 | `MISS_UPSTREAM` | Primary leader worker forwarded request to upstream and cached response. |
 | `BYPASS_STREAM` | Streaming completion (`stream: true`) forwarded through watchdog proxy. |
-| `BYPASS_NO_STORE`| Request carried `Cache-Control: no-store`; bypassed cache and coalescing. |
+| `BYPASS_NO_STORE`| Request carried `Cache-Control: no-store` or upstream sent `Cache-Control: no-store`. |
 | `BYPASS_OVERSIZED`| Upstream response exceeded response size cap; bypassed cache without error. |
-| `BYPASS_STOCHASTIC`| Deterministic-only replay active; request has temperature > 0 and no seed. |
+| `BYPASS_STABLE_ONLY`| Conservative replay active (`SEMCACHE_CONSERVATIVE_REPLAY=true`); request has temperature > 0 and no seed. |
 
 ---
 
@@ -97,20 +97,70 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 | Environment Variable | Default | Description |
 | :--- | :--- | :--- |
 | `SEMCACHE_BIND` | `127.0.0.1:3000` | Loopback socket address. Set `0.0.0.0:3000` in Docker (see below). |
-| `SEMCACHE_DB_PATH` | `semcache.db` | Filepath for SQLite database (auto-permissions `0600` on Unix). |
-| `OPENAI_UPSTREAM_URL` | `https://api.openai.com/v1/chat/completions` | Target upstream LLM completion endpoint. |
+| `SEMCACHE_DB_PATH` | `./data/semcache.db` | Filepath for SQLite database (auto-permissions `0600` on file, `0700` on dir). |
+| `SEMCACHE_UPSTREAM_URL` | `https://api.openai.com/v1/chat/completions` | Target upstream LLM completion endpoint. |
 | `SEMCACHE_DEFAULT_PROVIDER` | `openai` | Authoritative provider profile (`openai`, `ollama`, `generic`). |
 | `SEMCACHE_TENANT_ID` | `default_tenant` | Fallback tenant identifier for unauthenticated endpoints. |
-| `SEMCACHE_DETERMINISTIC_ONLY` | `false` | When true, only caches requests with `temperature == 0.0` or explicit `seed`. |
+| `SEMCACHE_CONSERVATIVE_REPLAY` | `false` | When true, only caches requests with `temperature == 0.0` or explicit `seed`. |
+| `SEMCACHE_ENABLE_METRICS` | `true` (loopback) / `false` (`0.0.0.0`) | Exposes Prometheus telemetry at `GET /metrics`. Auto-disabled on `0.0.0.0`. |
+| `SEMCACHE_UPSTREAM_TTFB_SECS` | `30` (standard) / `180` (reasoning) | Maximum Time-To-First-Byte before upstream fetch aborts. |
 | `SEMCACHE_CREDENTIAL_HEADERS` | `authorization,api-key,x-api-key,x-goog-api-key` | Comma-separated list of headers to salt for tenant isolation. |
-| `SEMCACHE_MAX_DB_BYTES` | `10737418240` (10 GB) | Disk storage limit; auto-prunes oldest records and vacuums on overflow. |
+| `SEMCACHE_MAX_DB_BYTES` | `2147483648` (2 GB) | Disk storage limit; auto-prunes oldest records on background connection. |
 | `SEMCACHE_MAX_REQUEST_BYTES` | `33554432` (32 MB) | Maximum request size (accommodates base64 vision images; HTTP 413). |
 | `SEMCACHE_MAX_RESPONSE_BYTES`| `10485760` (10 MB) | Maximum response size; larger payloads bypass cache via streaming. |
 | `SEMCACHE_MAX_READY_BYTES` | `134217728` (128 MB) | Bounded memory ceiling for in-flight `Ready` responses. |
 | `SEMCACHE_MAX_CONCURRENT_WRITES` | `4` | Concurrency limit on SQLite writer tasks with 5-failure circuit breaker. |
 | `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` | `256` | Upstream concurrency permit ceiling (returns HTTP 503 + Retry-After: 5 on shed). |
-| `SEMCACHE_TTL_DAYS` | `7` | Cache entry retention window before automatic pruning (`PRAGMA wal_checkpoint(TRUNCATE)`). |
+| `SEMCACHE_TTL_DAYS` | `7` | Cache entry retention window before automatic background pruning. |
 | `SEMCACHE_UPSTREAM_TIMEOUT_SECS` | `300` | Maximum overall upstream HTTP connection timeout. |
+
+### Replay Policy Trade-Off: Conservative Replay
+The setting `SEMCACHE_CONSERVATIVE_REPLAY` defaults to **`false`**.
+- **Default (`false`):** Caches and replays all canonical prompt hits regardless of temperature. This delivers maximum cache hit rates for AI agent retry loops, automated test suites, and development iteration.
+- **Conservative (`true`):** Strict mode. Skips caching any request that does not explicitly set `temperature: 0` or an explicit `seed` with `temperature <= 0.0`. We avoid calling this "deterministic" because GPU floating point non-associativity, MoE routing, and provider-side dynamic batching mean true determinism cannot be guaranteed even with seed.
+
+---
+
+## Architecture Decision Records (ADRs)
+
+SemCache maintains an append-only ADR register documented in Michael Nygard format in [`decision.md`](decision.md):
+
+- **[ADR 001](decision.md#adr-001-rust-over-gonodejs-for-the-proxy-hot-path):** Rust over Go/Node.js for zero GC pauses on proxy hot paths.
+- **[ADR 002](decision.md#adr-002-embedded-sqlite-with-wal--sqlite-vec-over-external-vector-stores):** Embedded SQLite with WAL mode over external vector DBMS infrastructure.
+- **[ADR 003](decision.md#adr-003-single-flight-request-coalescing-via-dashmap-and-tokio-broadcast):** Single-flight request coalescing via DashMap and Tokio broadcast channels.
+- **[ADR 004](decision.md#adr-004-blake3-as-the-l1-cryptographic-key-derivation-function):** BLAKE3 as the L1 cryptographic key derivation function.
+- **[ADR 005](decision.md#adr-005-strict-rejection-of-server-sent-events-sse-streaming-in-mvp):** Strict rejection of SSE streaming *(Superseded by ADR 010)*.
+- **[ADR 006](decision.md#adr-006-asynchronous-off-critical-path-persistence-to-sqlite):** Asynchronous off-critical-path persistence to SQLite.
+- **[ADR 007](decision.md#adr-007-mandatory-resource-attribution-for-cli-tools):** Mandatory resource attribution for CLI commands.
+- **[ADR 008](decision.md#adr-008-syntax-preserving-non-destructive-canonicalization):** Syntax-preserving non-destructive AST canonicalization.
+- **[ADR 009](decision.md#adr-009-removal-first-atomic-broadcast-in-single-flight-coalescer):** Removal-first atomic broadcast in single-flight coalescer.
+- **[ADR 010](decision.md#adr-010-transparent-non-blocking-streaming-bypass):** Transparent non-blocking streaming bypass with dual-stage timeout.
+- **[ADR 011](decision.md#adr-011-bounded-concurrency-semaphore-for-sqlite-disk-writers):** Bounded concurrency semaphore for SQLite disk writers.
+- **[ADR 012](decision.md#adr-012-provider-aware-default-hyperparameter-normalization):** Provider-aware default hyperparameter normalization.
+- **[ADR 013](decision.md#adr-013-state-gated-in-flight-raii-guard-lifecycle):** State-gated in-flight RAII guard lifecycle.
+- **[ADR 014](decision.md#adr-014-semcache-v11-architectural-blueprint):** SemCache v1.1 architectural blueprint.
+- **[ADR 015](decision.md#adr-015-in-code-recursive-ast-key-sorting-for-feature-unification-immunity):** In-code recursive AST key sorting immune to Cargo feature unification.
+- **[ADR 016](decision.md#adr-016-multi-header-credential-salting-first-match-precedence-and-authoritative-provider-isolation):** Multi-header credential salting precedence *(Superseded by ADR 019)*.
+- **[ADR 017](decision.md#adr-017-fail-open-sqlite-storage-degradation--write-circuit-breaker):** Fail-open SQLite storage degradation & write circuit breaker.
+- **[ADR 018](decision.md#adr-018-gateway-memory-payload-size-and-concurrency-bounds):** Gateway memory, payload size, and concurrency bounds.
+- **[ADR 019](decision.md#adr-019-multi-header-credential-salting--length-prefixed-tenant-isolation):** Multi-header length-prefixed credential salting for collision-proof tenant isolation.
+- **[ADR 020](decision.md#adr-020-circuit-breaker-real-write-errors--automatic-success-recovery):** Circuit breaker real-write error accounting and automatic success recovery.
+- **[ADR 021](decision.md#adr-021-conservative-replay-policy-semcache_conservative_replay):** Conservative replay policy (`SEMCACHE_CONSERVATIVE_REPLAY`) with default `false`.
+- **[ADR 022](decision.md#adr-022-dedicated-connection-off-path-storage-bounding--non-blocking-vacuum):** Dedicated-connection off-path storage bounding & disk-backed vacuum.
+- **[ADR 023](decision.md#adr-023-prometheus-metrics-exposition--loopback-only-security-gating):** Prometheus metrics exposition & loopback-only security gating.
+- **[ADR 024](decision.md#adr-024-stream-concurrency-permit-retention--mid-stream-disconnect-cleanup):** Stream concurrency permit retention & mid-stream disconnect cleanup.
+- **[ADR 025](decision.md#adr-025-process-local-file-and-directory-permissions-security):** Process-local `0600` file and `0700` directory security (dropped process-wide umask).
+- **[ADR 026](decision.md#adr-026-upstream-response-cache-control-no-store-compliance):** Upstream response `Cache-Control: no-store` compliance.
+
+---
+
+## What's NOT Shipped (Honest Boundaries)
+
+SemCache is focused on solving local and CI caching with maximum engineering rigor. We intentionally do not ship:
+1. **Multi-Node Distributed Clustering:** SemCache is an embedded, single-node local-first proxy. It does not synchronize cache tables across nodes or run Raft/Paxos.
+2. **Unvalidated Vector Distance Caching:** We do not perform fuzzy semantic vector lookups with uncalibrated similarity thresholds that return incorrect responses. Exact match L1 is 100% reliable and verified.
+3. **Client-Side Credential Storage:** We never persist raw API keys or client credentials to SQLite disk or structured telemetry.
+4. **Synthetic SSE Token Playback:** Streams are passed through transparently without synthetic chunk fabrication.
 
 ---
 
@@ -124,7 +174,8 @@ Every response processed by SemCache includes the `x-semcache-status` header:
 > ```bash
 > -e SEMCACHE_BIND="0.0.0.0:3000"
 > ```
-> **CRITICAL SECURITY REQUIREMENT:** Never expose port 3000 directly to the public internet when bound to `0.0.0.0`. SemCache is an internal accelerating proxy. Always deploy it in a private subnet or front it with a secure reverse proxy (Nginx, Traefik, Envoy, Cloudflare Access) that terminates TLS and enforces ingress authentication.
+> When bound to `0.0.0.0:3000`, `/metrics` is **disabled by default** to prevent external telemetry leakage.
+> Always deploy SemCache in a private network or front it with an authenticated reverse proxy (Nginx, Envoy, Cloudflare).
 
 ---
 
@@ -153,12 +204,11 @@ export OPENAI_BASE_URL="http://127.0.0.1:3000/v1"
 curl http://127.0.0.1:3000/healthz
 # {"status":"ok","service":"semcache"}
 
-# Prometheus metrics exposition
+# Prometheus metrics exposition (available on loopback)
 curl http://127.0.0.1:3000/metrics
 # # HELP semcache_requests_total Total number of chat completion requests received
 # # TYPE semcache_requests_total counter
 # semcache_requests_total 42
-# ...
 ```
 
 ---
@@ -166,16 +216,26 @@ curl http://127.0.0.1:3000/metrics
 ## Test Verification Suite
 
 ```bash
-# Run unit and integration tests (54 tests across all suites)
-cargo test --release
+# Run full unit and integration test suite (58 tests passing)
+cargo test
 
-# Run multi-threaded barrier stampede and governance tests
-cargo test --test integration_tests --release
+# Run property-based invariants (proptest)
+cargo test --test canonical_proptest
 
-# Run sustained soak and stress benchmarks
-cargo test --test soak_test --release
+# Run sustained soak suite (20k+ req/s, 0 memory leaks)
+cargo test --test soak_test
+
+# Run long-horizon 30-minute soak test
+cargo test --test soak_test -- test_long_horizon_sustained_soak_30min --ignored --nocapture
 
 # Enforce zero clippy warnings and unwrap/expect denials
 cargo clippy --all-targets -- -D warnings
 ```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
 

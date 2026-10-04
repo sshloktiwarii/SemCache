@@ -136,23 +136,33 @@ Code generation prompts are hypersensitive to whitespace manipulation. SemCache 
 - Outermost edges of message `content` and `prompt` strings are trimmed.
 - **Internal indentation, newlines, tabs, and line feeds are preserved 100% verbatim.**
 
-### Tenant-Salted BLAKE3 Key Derivation & First-Match Precedence
-Credential salting evaluates headers with strict First-Match Precedence:
-$$\text{Authorization} \succ \text{api-key} \succ \text{x-api-key} \succ \text{SEMCACHE\_TENANT\_ID}$$
+### Tenant-Salted BLAKE3 Key Derivation & Length-Prefixed Hashing
+Credential salting evaluates configured credential headers (`authorization`, `api-key`, `x-api-key`, `x-goog-api-key`), sorts matched headers lexicographically by lowercase name, and hashes each `(name, value)` pair with 32-bit little-endian length prefixes to mathematically eliminate boundary collision attacks:
+$$\text{SaltHasher} \leftarrow \bigoplus_{i} \left[ \text{len}(K_i)_{\text{u32 LE}} \,\|\, K_i \,\|\, \text{len}(V_i)_{\text{u32 LE}} \,\|\, V_i \right]$$
 
 ```rust
-let auth_str = headers
-    .get(header::AUTHORIZATION)
-    .or_else(|| headers.get("api-key"))
-    .or_else(|| headers.get("x-api-key"))
-    .and_then(|h| h.to_str().ok());
-
-let tenant_salt = auth_str.unwrap_or(&state.default_tenant_id);
-
+// Length-prefixed multi-header credential salt (ADR-019)
 let mut hasher = blake3::Hasher::new();
+if matched.is_empty() {
+    let tenant_bytes = default_tenant_id.trim().as_bytes();
+    hasher.update(&(tenant_bytes.len() as u32).to_le_bytes());
+    hasher.update(tenant_bytes);
+} else {
+    matched.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, val) in matched {
+        hasher.update(&(name.len() as u32).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(val.len() as u32).to_le_bytes());
+        hasher.update(val.as_bytes());
+    }
+}
+let cred_salt = hasher.finalize().as_bytes().to_vec();
+```
+The resulting credential salt is absorbed into the canonical request payload hash:
+```rust
 hasher.update(&canonical_json_bytes);
-hasher.update(b"|auth_tenant:");
-hasher.update(tenant_salt.trim().as_bytes());
+hasher.update(b"|auth_salt:");
+hasher.update(&cred_salt);
 let hash: [u8; 32] = *hasher.finalize().as_bytes();
 ```
 
@@ -422,49 +432,37 @@ In v1.1, memory eviction will be explicitly coupled to the SQLite completion eve
 
 ---
 
-## 10. Architectural Decision Records (ADRs: 016–022)
+## 10. Architectural Decision Records (ADR 001–026)
 
-### ADR-016: Multi-Header Credential Salting Isolation
-- **Context:** Previous implementations used first-match precedence (`Authorization`, then `api-key`, then `x-api-key`). In API gateway topologies, multiple callers frequently share a gateway `Authorization` bearer token while differing in downstream user `api-key` headers. A first-match precedence collapsed them into the same cache partition, causing cross-tenant cache leakage.
-- **Decision:** Concatenate and sort *all* present credential headers defined in `credential_headers` (defaulting to `authorization`, `api-key`, `x-api-key`, `x-goog-api-key`). The salt format is `k1=v1;k2=v2`. Callers sharing a gateway token but differing in user keys land in strictly isolated cache partitions.
+All architectural decisions are formally documented in accordance with the Michael Nygard ADR standard in [`decision.md`](decision.md). ADRs are strictly append-only; historical decisions are marked superseded rather than renumbered.
 
-### ADR-017: Circuit Breaker Real-Write Errors & Success Recovery
-- **Context:** Counting write-semaphore saturation (queue timeouts during heavy write bursts) toward the 5 consecutive failure threshold caused the circuit breaker to trip during load spikes on completely healthy disks. Tripping the breaker evicted `Ready` entries from RAM, opening the duplicate-call window during stampedes. Furthermore, once tripped, there was no recovery path to re-close the breaker.
-- **Decision:** Write queue backpressure drops are tracked as `dropped_writes_total` without incrementing `consecutive_write_failures`. Only actual SQLite disk write errors or worker panics increment `consecutive_write_failures`. Any subsequent successful SQLite write immediately resets `consecutive_write_failures` to 0, automatically re-closing the breaker.
-
-### ADR-018: Deterministic-Only Replay Policy (`SEMCACHE_DETERMINISTIC_ONLY`)
-- **Context:** Default LLM requests with `temperature == 1.0` and no seed are stochastic. Caching and replaying them for the full 7-day TTL requires client cooperation (`no-store`).
-- **Decision:** Introduce `SEMCACHE_DETERMINISTIC_ONLY=true`. When enabled, requests are evaluated via `is_payload_deterministic`: only payloads with `temperature == 0.0` or an explicit `seed` are cached and replayed. Stochastic requests bypass cache storage with `x-semcache-status: BYPASS_STOCHASTIC`.
-
-### ADR-019: Storage Capacity Bounding & Vacuum Strategy
-- **Context:** While TTL expiration purges expired records, continuous writes under heavy load without a disk cap can exhaust storage, and SQLite does not automatically reclaim disk space without vacuuming.
-- **Decision:** Introduce `SEMCACHE_MAX_DB_BYTES` (default 10 GB) and background maintenance. When the database size exceeds the threshold, `prune_oldest_records` purges the oldest entries until size drops below 80% of the limit. Periodic incremental or full `VACUUM` is invoked, and reader pool checkout timeout is bounded to 500ms to fail-open under disk stalls.
-
-### ADR-020: Prometheus Metrics Exposition & Background Telemetry
-- **Context:** Production operators require real-time visibility into cache hit rates, upstream shedding, dropped writes, and circuit breaker status.
-- **Decision:** Expose `GET /metrics` returning Prometheus-compatible text exposition format covering:
-  - `semcache_requests_total`
-  - `semcache_l1_hits_total`
-  - `semcache_coalesced_hits_total`
-  - `semcache_upstream_fetches_total`
-  - `semcache_streaming_bypasses_total`
-  - `semcache_oversized_bypasses_total`
-  - `semcache_stochastic_bypasses_total`
-  - `semcache_upstream_shed_total`
-  - `semcache_dropped_writes_total`
-  - `semcache_consecutive_write_failures`
-  - `semcache_circuit_breaker_open`
-  - `semcache_ready_bytes`
-  - `semcache_in_flight_requests`
-  A background task additionally outputs a periodic structured telemetry log line every 30 seconds.
-
-### ADR-021: Stream Concurrency Permit Retention & Mid-Stream Disconnect Cleanup
-- **Context:** Streaming requests bypass coalescing and connect directly upstream. Holding an upstream permit without releasing it on mid-stream client disconnect would permanently exhaust the 256 concurrency permits, causing 503 errors.
-- **Decision:** `IdleTimeoutStream` encapsulates `_permit: Option<OwnedSemaphorePermit>`. The permit is held for the full duration of the SSE stream. If the client disconnects or aborts, Axum drops the response body, which drops `IdleTimeoutStream`, immediately releasing the permit back to the semaphore.
-
-### ADR-022: File Permissions Security Timing
-- **Context:** Setting `chmod 0600` on the database file after SQLite opens it leaves `-wal` and `-shm` temporary files created under the process's default umask (typically 0022 / 0644), exposing prompt logs to other users on multi-user systems.
-- **Decision:** On Unix platforms, `libc::umask(0o077)` is invoked before opening the database pool, and the target database file is pre-created with `0600` permissions. All secondary SQLite files (`-wal`, `-shm`) inherit restricted `0600` mode. Relative paths are resolved to absolute paths before initialization.
+### Summary Index of Current ADRs
+- **[ADR 001](decision.md#adr-001-rust-over-gonodejs-for-the-proxy-hot-path):** Rust over Go/Node.js for the Proxy Hot Path
+- **[ADR 002](decision.md#adr-002-embedded-sqlite-with-wal--sqlite-vec-over-external-vector-stores):** Embedded SQLite with WAL & sqlite-vec over External Vector Stores
+- **[ADR 003](decision.md#adr-003-single-flight-request-coalescing-via-dashmap-and-tokio-broadcast):** Single-Flight Request Coalescing via DashMap and Tokio Broadcast
+- **[ADR 004](decision.md#adr-004-blake3-as-the-l1-cryptographic-key-derivation-function):** BLAKE3 as the L1 Cryptographic Key Derivation Function
+- **[ADR 005](decision.md#adr-005-strict-rejection-of-server-sent-events-sse-streaming-in-mvp):** Strict Rejection of SSE Streaming in MVP *(Superseded by ADR 010)*
+- **[ADR 006](decision.md#adr-006-asynchronous-off-critical-path-persistence-to-sqlite):** Asynchronous Off-Critical-Path Persistence to SQLite
+- **[ADR 007](decision.md#adr-007-mandatory-resource-attribution-for-cli-tools):** Mandatory Resource Attribution for CLI Tools
+- **[ADR 008](decision.md#adr-008-syntax-preserving-non-destructive-canonicalization):** Syntax-Preserving Non-Destructive Canonicalization
+- **[ADR 009](decision.md#adr-009-removal-first-atomic-broadcast-in-single-flight-coalescer):** Removal-First Atomic Broadcast in Single-Flight Coalescer
+- **[ADR 010](decision.md#adr-010-transparent-non-blocking-streaming-bypass):** Transparent Non-Blocking Streaming Bypass with Dual-Stage Timeout
+- **[ADR 011](decision.md#adr-011-bounded-concurrency-semaphore-for-sqlite-disk-writers):** Bounded Concurrency Semaphore for SQLite Disk Writers
+- **[ADR 012](decision.md#adr-012-provider-aware-default-hyperparameter-normalization):** Provider-Aware Default Hyperparameter Normalization
+- **[ADR 013](decision.md#adr-013-state-gated-in-flight-raii-guard-lifecycle):** State-Gated In-Flight RAII Guard Lifecycle
+- **[ADR 014](decision.md#adr-014-semcache-v11-architectural-blueprint):** SemCache v1.1 Architectural Blueprint
+- **[ADR 015](decision.md#adr-015-in-code-recursive-ast-key-sorting-for-feature-unification-immunity):** In-Code Recursive AST Key Sorting for Feature Unification Immunity
+- **[ADR 016](decision.md#adr-016-multi-header-credential-salting-first-match-precedence-and-authoritative-provider-isolation):** Multi-Header Credential Salting & Provider Isolation *(Superseded by ADR 019)*
+- **[ADR 017](decision.md#adr-017-fail-open-sqlite-storage-degradation--write-circuit-breaker):** Fail-Open SQLite Storage Degradation & Write Circuit Breaker
+- **[ADR 018](decision.md#adr-018-gateway-memory-payload-size-and-concurrency-bounds):** Gateway Memory, Payload Size, and Concurrency Bounds
+- **[ADR 019](decision.md#adr-019-multi-header-credential-salting--length-prefixed-tenant-isolation):** Multi-Header Credential Salting & Length-Prefixed Tenant Isolation
+- **[ADR 020](decision.md#adr-020-circuit-breaker-real-write-errors--automatic-success-recovery):** Circuit Breaker Real-Write Errors & Automatic Success Recovery
+- **[ADR 021](decision.md#adr-021-conservative-replay-policy-semcache_conservative_replay):** Conservative Replay Policy (`SEMCACHE_CONSERVATIVE_REPLAY`)
+- **[ADR 022](decision.md#adr-022-dedicated-connection-off-path-storage-bounding--non-blocking-vacuum):** Dedicated-Connection Off-Path Storage Bounding & Non-Blocking Vacuum
+- **[ADR 023](decision.md#adr-023-prometheus-metrics-exposition--loopback-only-security-gating):** Prometheus Metrics Exposition & Loopback-Only Security Gating
+- **[ADR 024](decision.md#adr-024-stream-concurrency-permit-retention--mid-stream-disconnect-cleanup):** Stream Concurrency Permit Retention & Mid-Stream Disconnect Cleanup
+- **[ADR 025](decision.md#adr-025-process-local-file-and-directory-permissions-security):** Process-Local File and Directory Permissions Security
+- **[ADR 026](decision.md#adr-026-upstream-response-cache-control-no-store-compliance):** Upstream Response `Cache-Control: no-store` Compliance
 
 ---
 
@@ -472,11 +470,13 @@ In v1.1, memory eviction will be explicitly coupled to the SQLite completion eve
 
 | Verification Category | Command | Target / SLA | Status |
 | :--- | :--- | :--- | :--- |
-| **Unit Suite** | `cargo test --lib` | 23/23 tests passing | Verified |
-| **Integration Suite** | `cargo test --test integration_tests` | 26/26 tests passing | Verified |
-| **Soak & Benchmark Suite** | `cargo test --test soak_test` | 5/5 tests passing ($> 4,400\,\text{req/s}$, 99% offload) | Verified |
-| **Total Test Suite** | `cargo test` | 54/54 tests passing | Verified |
+| **Unit Suite** | `cargo test --lib` | 24/24 tests passing | Verified |
+| **Integration Suite** | `cargo test --test integration_tests` | 29/29 tests passing | Verified |
+| **Property-Based Invariants** | `cargo test --test canonical_proptest` | 3/3 property tests passing | Verified |
+| **Soak & Benchmark Suite** | `cargo test --test soak_test` | Passing ($> 20,000\,\text{req/s}$, 0 leaks, 30m suite under `#[ignore]`) | Verified |
+| **Total Test Suite** | `cargo test` | 58 tests passing, 0 failed, 1 ignored | Verified |
 | **Static Linting & Denial** | `cargo clippy --all-targets -- -D warnings` | Zero warnings; `#![deny(clippy::unwrap_used, clippy::expect_used)]` | Verified |
-| **Full History Secrets Audit** | `git grep "sk-" $(git rev-list --all)` | Zero production keys/secrets committed across entire git history | Verified |
-| **File Permissions** | `stat -f "%OLp" semcache.db*` | Exactly `0600` on `.db`, `-wal`, `-shm` | Verified |
+| **Refined Secrets Audit** | `git grep -E "\bsk-[a-zA-Z0-9_-]+" \| grep -v -E "sk-(test\|tenant\|mock\|alice\|bob\|shared\|sentinel\|soak)"` | Zero production keys/secrets committed across entire git history | Verified |
+| **File Permissions** | `stat -f "%OLp" semcache.db*` | Exactly `0600` on `.db`, `-wal`, `-shm` (parent directory `0700`) | Verified |
+
 

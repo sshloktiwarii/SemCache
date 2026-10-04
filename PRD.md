@@ -53,13 +53,13 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 ## 3. Core Functional Requirements (FR)
 
 ### FR-01: OpenAI-Compatible Ingress Proxy
-- The gateway must bind to `0.0.0.0:3000` (configurable via `SEMCACHE_BIND`).
-- Must expose an OpenAI-compatible endpoint: `POST /v1/chat/completions`.
-- Must preserve incoming HTTP `Authorization` bearer tokens and pass them upstream.
+- The gateway binds to `127.0.0.1:3000` by default (configurable via `SEMCACHE_BIND`).
+- Exposes an OpenAI-compatible endpoint: `POST /v1/chat/completions`.
+- Preserves incoming HTTP `Authorization` and credential headers, passing them upstream.
 
 ### FR-02: Syntax-Preserving Canonicalization Engine
-- **Non-Generative Metadata Stripping:** The gateway must parse incoming JSON payloads and strip client tracking metadata (`user`).
-- **Default Parameter Stripping:** If `stream: false` is present, it must be stripped to prevent cache divergence from omitted keys.
+- **Non-Generative Metadata Stripping:** The gateway parses incoming JSON payloads and strips client tracking metadata (`user`).
+- **Default Parameter Stripping:** If `stream: false` is present, it is stripped to prevent cache divergence from omitted keys.
 - **Generative Hyperparameter Preservation:** Hyperparameters that alter generation dynamics (`temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `seed`, `logit_bias`) are preserved in the cache key.
 - **Provider-Aware Default Normalization:**
   - `OpenAi`: Normalizes `temperature: 1.0`, `top_p: 1.0`, `presence_penalty: 0.0`, `frequency_penalty: 0.0`.
@@ -68,14 +68,17 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 - **Syntax-Preserving Text Normalization:**
   - Content strings in `messages` and `prompt` are trimmed only at the outermost string boundaries.
   - Internal indentation, tabs, newlines, and formatting are preserved 100% verbatim to protect code blocks, YAML, and Markdown.
-- **Multi-Tenant Salting:** Incorporates `auth_header` into the BLAKE3 digest (`|auth_tenant:<token>`) ensuring complete multi-tenant cache isolation.
+- **Length-Prefixed Multi-Tenant Salting (ADR-019):** Credential headers (`authorization`, `api-key`, `x-api-key`, `x-goog-api-key`) are extracted, sorted lexicographically, and encoded with length prefixes:
+  $$\text{SaltHasher} \leftarrow \bigoplus_{i} \left[ \text{len}(K_i)_{\text{u32 LE}} \,\|\, K_i \,\|\, \text{len}(V_i)_{\text{u32 LE}} \,\|\, V_i \right]$$
+  If unauthenticated, length-prefixed `SEMCACHE_TENANT_ID` is used. Prevents delimiter-shifting collision attacks.
 
 ### FR-03: Non-Blocking Streaming Bypass
 - If an incoming payload contains `stream: true`, the gateway bypasses caching and transparently proxies the stream to the upstream LLM endpoint.
 - **Dual-Stage Timeout Watchdog:** The stream is wrapped in `IdleTimeoutStream`, enforcing:
-  1. A 180-second Time-To-First-Byte (TTFB) timeout to accommodate reasoning models (`o1`, `o3-mini`, `deepseek-r1`) during extended thinking phases.
+  1. A configurable Time-To-First-Byte (TTFB) timeout (`SEMCACHE_UPSTREAM_TTFB_SECS`, default 180s for reasoning models, 30s for standard) to accommodate extended thinking phases.
   2. A 30-second inter-chunk idle watchdog once token streaming commences.
 - Responses are tagged with header `x-semcache-status: BYPASS_STREAM`.
+- Upstream concurrency permits are held via RAII and automatically released on client disconnect, preventing ghost tasks.
 
 ### FR-04: L1 Exact-Match Deterministic Caching
 - Compute a 32-byte BLAKE3 hash over the canonicalized JSON bytes with tenant salt.
@@ -86,7 +89,7 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
   - Content-Type must be `application/json`.
 
 ### FR-05: Single-Flight Request Coalescing
-- When an L1 cache miss occurs, the gateway must acquire a DashMap shard lock on `InFlightMap`:
+- When an L1 cache miss occurs, the gateway acquires a DashMap shard lock on `InFlightMap`:
   - **Follower (Pending):** If an upstream query is in flight, subscribe to a `tokio::sync::broadcast` channel and asynchronously await the leader's response. On receipt, return the payload with header `x-semcache-status: HIT_COALESCED`.
   - **Follower (Ready):** If the response is already in memory pending disk write, immediately return a clone of the payload.
   - **Primary Leader:** Register as the leader, retain a state-gated `LeaderGuard`, and proceed to upstream execution.
@@ -104,12 +107,24 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
   - The error payload and status code must be returned to the client immediately.
   - The error response **MUST NOT** be persisted into the cache.
 
-### FR-08: Bounded Asynchronous Persistence Layer
+### FR-08: Dedicated Off-Path Persistence & Storage Bounding (ADR-022)
 - Upon receiving a successful 2xx response from upstream:
   - Transition in-flight state to `Ready` and broadcast bytes to awaiting followers.
   - Asynchronously persist into SQLite WAL using `tokio::task::spawn_blocking` gated behind an `Arc<tokio::sync::Semaphore>` (4 concurrent permits, 250ms acquisition timeout).
-  - Configures `PRAGMA busy_timeout = 5000;` on all connections to handle lock contention.
-  - Leader awaits the write handle before evicting the in-flight memory entry.
+  - Background database maintenance (TTL expiration, soft-cap LRU pruning below `SEMCACHE_MAX_DB_BYTES`, non-blocking VACUUM) runs once per hour on a dedicated SQLite connection completely off the request hot path.
+  - SQLite temporary storage configured with `PRAGMA temp_store = FILE;` to guarantee memory safety.
+
+### FR-09: Replay Policy & Conservative Mode (ADR-021)
+- Governed by `SEMCACHE_CONSERVATIVE_REPLAY` (default: `false`).
+- When `false` (default): Standard development and CI requests are cached and replayed based on canonical payload hashes, maximizing cache hit rate.
+- When `true`: Only requests with `temperature == 0.0` or a valid `seed` with `temperature <= 0.0` are cached and replayed; stochastic requests bypass cache storage with `x-semcache-status: BYPASS_STABLE_ONLY`.
+
+### FR-10: Upstream Response `Cache-Control: no-store` Compliance (ADR-026)
+- If an upstream LLM response contains `Cache-Control: no-store` (case-insensitive), SemCache serves the response to the client with `x-semcache-status: BYPASS_NO_STORE` and skips SQLite persistence, strictly honoring RFC 9111.
+
+### FR-11: Gated Prometheus Metrics Telemetry (ADR-023)
+- Governed by `SEMCACHE_ENABLE_METRICS`.
+- Automatically enabled when bound to loopback (`127.0.0.1`), and default disabled when bound to `0.0.0.0` to prevent unauthenticated cache usage pattern leaks in container networks. Returns HTTP 404 when disabled.
 
 ---
 
@@ -118,15 +133,37 @@ Autonomous AI agents, coding assistants, and multi-agent coordination loops exec
 | ID | Category | Requirement Specification |
 | :--- | :--- | :--- |
 | **NFR-01** | **Latency SLA** | L1 cache hits must return with P99 latency $< 1.5\text{ms}$. Coalesced followers receive responses $< 0.5\text{ms}$ after leader completion. |
-| **NFR-02** | **Memory Safety** | Zero `.unwrap()`, `.expect()`, or explicit panics in production request paths. Memory leaks strictly prevented by state-gated RAII guards. |
-| **NFR-03** | **Storage Engine** | Embedded SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;`). Zero external DBMS dependencies. |
-| **NFR-04** | **Concurrency** | The gateway must sustain a minimum of 5,000 concurrent client connections without connection pool exhaustion or socket starvation. |
+| **NFR-02** | **Memory Safety** | Zero `.unwrap()`, `.expect()`, or explicit panics in production request paths. Memory leaks strictly prevented by state-gated RAII guards and circuit breaker. |
+| **NFR-03** | **Storage Engine** | Embedded SQLite with Write-Ahead Logging (`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000; PRAGMA temp_store = FILE;`). Zero external DBMS dependencies. |
+| **NFR-04** | **Concurrency & Pool Sizing** | The gateway must sustain 5,000+ concurrent client connections. Reader pool is sized to 32/64 connections with 500ms checkout timeout to fail-open gracefully under disk stalls, operating against microsecond SQLite WAL memory-mapped read loops without thread starvation. |
 | **NFR-05** | **Zero Allocation** | Critical hot paths must utilize zero-copy `bytes::Bytes` slicing to minimize heap allocations during HTTP and disk shuttling. |
 | **NFR-06** | **Telemetry** | Every response must include diagnostic headers (`x-semcache-status`) and emit structured logs via `tracing`. |
+| **NFR-07** | **Process Security** | Avoid process-wide umask modifications. Pre-create database files with `0600` permissions and containing directories with `0700` mode. |
 
 ---
 
-## 5. System State Machine & Request Lifecycle
+## 5. Configuration & Environment Variables
+
+| Variable | Default Value | Description |
+| :--- | :--- | :--- |
+| `SEMCACHE_BIND` | `127.0.0.1:3000` | Gateway listen address and port. |
+| `SEMCACHE_UPSTREAM_URL` | `https://api.openai.com` | Target OpenAI-compatible LLM endpoint. |
+| `SEMCACHE_DB_PATH` | `./data/semcache.db` | Local SQLite database file path. |
+| `SEMCACHE_MAX_DB_BYTES` | `2147483648` (2 GB) | Soft cap on database disk storage. Prunes oldest records above limit. |
+| `SEMCACHE_MAX_REQUEST_BYTES` | `33554432` (32 MB) | Ingress request payload cap (supports vision / multimodal prompts). |
+| `SEMCACHE_MAX_RESPONSE_BYTES` | `10485760` (10 MB) | Response buffer cap before bypassing cache for oversized streams. |
+| `SEMCACHE_MAX_READY_BYTES` | `134217728` (128 MB) | Bounded in-flight RAM buffer cap for coalesced follower dispatches. |
+| `SEMCACHE_MAX_UPSTREAM_CONCURRENCY` | `256` | Maximum concurrent upstream HTTP dispatches before 503 shedding. |
+| `SEMCACHE_CONSERVATIVE_REPLAY` | `false` | When true, only caches and replays `temperature: 0` or seeded traffic. |
+| `SEMCACHE_ENABLE_METRICS` | `true` (loopback) / `false` (`0.0.0.0`) | Exposes Prometheus telemetry at `GET /metrics`. |
+| `SEMCACHE_UPSTREAM_TTFB_SECS` | `30` (standard) / `180` (reasoning) | Maximum Time-To-First-Byte before upstream fetch aborts. |
+| `SEMCACHE_DEFAULT_PROVIDER` | `openai` | Normalization profile (`openai`, `ollama`, `generic`). |
+| `SEMCACHE_TENANT_ID` | `default_tenant` | Namespace partition for unauthenticated client requests. |
+| `SEMCACHE_CREDENTIAL_HEADERS` | `authorization,api-key,x-api-key,x-goog-api-key` | Header names absorbed into the length-prefixed credential salt. |
+
+---
+
+## 6. System State Machine & Request Lifecycle
 
 ```mermaid
 stateDiagram-v2
