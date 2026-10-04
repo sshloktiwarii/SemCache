@@ -22,9 +22,17 @@
 - [ADR 013: State-Gated In-Flight RAII Guard Lifecycle](#adr-013-state-gated-in-flight-raii-guard-lifecycle)
 - [ADR 014: SemCache v1.1 Architectural Blueprint](#adr-014-semcache-v11-architectural-blueprint)
 - [ADR 015: In-Code Recursive AST Key Sorting for Feature Unification Immunity](#adr-015-in-code-recursive-ast-key-sorting-for-feature-unification-immunity)
-- [ADR 016: Multi-Header Credential Salting and Unauthenticated Namespace Isolation](#adr-016-multi-header-credential-salting-and-unauthenticated-namespace-isolation)
-- [ADR 017: Fail-Open SQLite Storage Degradation](#adr-017-fail-open-sqlite-storage-degradation)
+- [ADR 016: Multi-Header Credential Salting and Unauthenticated Namespace Isolation (Superseded)](#adr-016-multi-header-credential-salting-first-match-precedence-and-authoritative-provider-isolation)
+- [ADR 017: Fail-Open SQLite Storage Degradation & Write Circuit Breaker](#adr-017-fail-open-sqlite-storage-degradation--write-circuit-breaker)
 - [ADR 018: Gateway Memory, Payload Size, and Concurrency Bounds](#adr-018-gateway-memory-payload-size-and-concurrency-bounds)
+- [ADR 019: Multi-Header Credential Salting & Length-Prefixed Tenant Isolation](#adr-019-multi-header-credential-salting--length-prefixed-tenant-isolation)
+- [ADR 020: Circuit Breaker Real-Write Errors & Automatic Success Recovery](#adr-020-circuit-breaker-real-write-errors--automatic-success-recovery)
+- [ADR 021: Conservative Replay Policy (`SEMCACHE_CONSERVATIVE_REPLAY`)](#adr-021-conservative-replay-policy-semcache_conservative_replay)
+- [ADR 022: Dedicated-Connection Off-Path Storage Bounding & Non-Blocking Vacuum](#adr-022-dedicated-connection-off-path-storage-bounding--non-blocking-vacuum)
+- [ADR 023: Prometheus Metrics Exposition & Loopback-Only Security Gating](#adr-023-prometheus-metrics-exposition--loopback-only-security-gating)
+- [ADR 024: Stream Concurrency Permit Retention & Mid-Stream Disconnect Cleanup](#adr-024-stream-concurrency-permit-retention--mid-stream-disconnect-cleanup)
+- [ADR 025: Process-Local File and Directory Permissions Security](#adr-025-process-local-file-and-directory-permissions-security)
+- [ADR 026: Upstream Response `Cache-Control: no-store` Compliance](#adr-026-upstream-response-cache-control-no-store-compliance)
 
 ---
 
@@ -395,7 +403,7 @@ Implement `serialize_canonical_strict` in `src/canonical.rs` to recursively trav
 ## ADR 016: Multi-Header Credential Salting, First-Match Precedence, and Authoritative Provider Isolation
 
 ### Status
-**Accepted** (Implemented in Hardening Phase)
+**Superseded** by [ADR 019: Multi-Header Credential Salting & Length-Prefixed Tenant Isolation](#adr-019-multi-header-credential-salting--length-prefixed-tenant-isolation)
 
 ### Context
 AI client libraries use varying authentication headers: `Authorization` (OpenAI), `api-key` (Azure OpenAI), or `x-api-key` (Anthropic/LiteLLM). Furthermore, local LLMs (Ollama, vLLM) often run without authentication. If multi-header precedence is undefined, clients sending both `Authorization` and `api-key` (e.g. Azure OpenAI SDKs) could either cause cache collisions or generate silent cache misses across deployments. Additionally, allowing clients to override provider identity via `x-semcache-provider` introduces a Denial-of-Service vector where hostile clients arbitrarily partition the cache.
@@ -470,5 +478,169 @@ Unbounded request bodies, multi-hundred-megabyte responses, and unconstrained up
 - Concurrency exhaustion fails fast with standard HTTP 503 + `Retry-After: 5` semantics.
 - Seamless support for heavy multimodal vision prompts.
 - Full support for client-controlled bypass (`Cache-Control: no-store`).
+
+---
+
+## ADR 019: Multi-Header Credential Salting & Length-Prefixed Tenant Isolation
+
+### Status
+**Accepted** (Supersedes ADR 016)
+
+### Context
+SemCache isolates cache partitions by hashing authentication credentials into the cache key. Plain byte concatenation of multiple headers (e.g. `Authorization: "ab"` + `api-key: "c"` vs `Authorization: "a"` + `api-key: "bc"`) can result in identical byte sequences, creating a cross-tenant collision vulnerability.
+
+### Decision
+1. **Length-Prefixed Hashing:** Each credential header name and value is length-prefixed with a 32-bit little-endian integer before absorption into the BLAKE3 hasher:
+   $$\text{Hasher} \leftarrow \text{len}(K)_{\text{u32 LE}} \,\|\, K \,\|\, \text{len}(V)_{\text{u32 LE}} \,\|\, V$$
+2. **Canonical Header Sorting:** All matched credential headers (`authorization`, `api-key`, `x-api-key`) are extracted, converted to lowercase, sorted lexicographically by name, and encoded with length prefixes.
+3. **Unauthenticated Isolation:** If no credential headers exist, the length-prefixed `SEMCACHE_TENANT_ID` (default: `default_tenant`) is absorbed as the salt.
+
+### Consequences
+**Positive:**
+- Cryptographic immunity to delimiter-injection and boundary-shifting collision attacks.
+- Strict multi-tenant isolation across heterogeneous API key configurations.
+
+---
+
+## ADR 020: Circuit Breaker Real-Write Errors & Automatic Success Recovery
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Disk write failures (e.g., read-only filesystem, I/O corruption, out of disk space) must trigger fail-open behavior to protect gateway memory. However, transient write queue backpressure is a temporary capacity constraint, not persistent storage corruption. Furthermore, once disk storage recovers, the gateway should self-heal without manual restarts.
+
+### Decision
+1. **Real-Write Error Accounting:** Only genuine SQLite write errors increment the consecutive failure counter. Capacity-based write drops increment `semcache_dropped_writes_total` but do not trip the breaker.
+2. **Circuit Trip Threshold:** If consecutive real write errors reach 5, trip the breaker: evict completed items immediately from RAM `Ready` cache rather than retaining them for 10 seconds.
+3. **Automatic Reset:** Any successful SQLite write resets the consecutive failure counter to 0 and restores normal `Ready` cache retention.
+
+### Consequences
+**Positive:**
+- Prevents spurious circuit trips under high-concurrency burst traffic.
+- Automatic self-healing when underlying storage issues are resolved.
+
+---
+
+## ADR 021: Conservative Replay Policy (`SEMCACHE_CONSERVATIVE_REPLAY`)
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+Earlier designs referred to deterministic-only caching. In production LLMs, strict determinism cannot be guaranteed due to non-associative GPU floating-point operations, dynamic batching, and MoE routing. Furthermore, OpenAI documentation explicitly states that `seed` is best-effort. If a proxy caches only `temperature: 0` traffic by default, typical development and evaluation workloads achieve near-zero cache hit rates.
+
+### Decision
+1. **Renamed Configuration:** Rename the flag to `SEMCACHE_CONSERVATIVE_REPLAY` (with backward-compatible aliases `SEMCACHE_STABLE_ONLY` and `SEMCACHE_DETERMINISTIC_ONLY`).
+2. **Default Policy:** Default `SEMCACHE_CONSERVATIVE_REPLAY=false`. In this mode, standard requests are cached and replayed based on canonical payload hashes, maximizing cache efficiency for AI agents, CI runs, and developer iterations.
+3. **Conservative Mode:** When set to `true`, the proxy only persists and replays responses if the payload specifies `temperature == 0.0` or a valid `seed` with `temperature <= 0.0`. All other requests bypass cache storage with `x-semcache-status: BYPASS_STABLE_ONLY`.
+
+### Consequences
+**Positive:**
+- Honest, technically defensible naming and documentation.
+- High hit rate by default for developer and CI workflows.
+- Opt-in strict conservative mode for users who require zero stochastic variance.
+
+---
+
+## ADR 022: Dedicated-Connection Off-Path Storage Bounding & Non-Blocking Vacuum
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+SQLite's `VACUUM` command rebuilds the database file into a temporary file and acquires an exclusive write lock. If `PRAGMA temp_store = MEMORY;` is active, the temporary database is stored in RAM, causing memory spikes and possible OOM on multi-gigabyte databases. Furthermore, executing VACUUM or size-based pruning inside request write transactions introduces multi-second latency jitter for client queries.
+
+### Decision
+1. **Disk-Backed Temp Storage:** Configure `PRAGMA temp_store = FILE;` on all database connections.
+2. **Off-Path Background Maintenance:** All pruning (TTL expiration, soft-cap LRU eviction) and database maintenance run on an independent background thread with a dedicated SQLite connection, completely off the request hot path.
+3. **Sensible Laptop Defaults:** Reduce default `SEMCACHE_MAX_DB_BYTES` from 10 GB to 2 GB (`2147483648` bytes).
+4. **Maintenance Interval:** Pruning runs once per hour. VACUUM is only triggered if soft-cap pruning removes $> 25\%$ of database entries.
+
+### Consequences
+**Positive:**
+- Zero request latency spikes or writer lock contention from database maintenance.
+- Memory safety: vacuum operations use disk temporary files instead of process RAM.
+- Predictable 2 GB storage footprint on developer machines.
+
+---
+
+## ADR 023: Prometheus Metrics Exposition & Loopback-Only Security Gating
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+The `/metrics` endpoint exposes detailed gateway telemetry, including cache hit counts, token savings, and error rates. In containerized environments (Docker/Kubernetes), binding to `0.0.0.0` exposes this endpoint to the network. Exposing cache hit patterns allows external observers to infer client prompt frequency and cache behavior.
+
+### Decision
+1. **Feature Gate:** Add `SEMCACHE_ENABLE_METRICS` environment variable.
+2. **Security Default:** If the server is bound to an open network address (`0.0.0.0`), `SEMCACHE_ENABLE_METRICS` defaults to `false`. When bound to `127.0.0.1`, it defaults to `true`.
+3. **404 When Disabled:** When disabled, requests to `/metrics` return HTTP 404 Not Found.
+
+### Consequences
+**Positive:**
+- Prevents accidental telemetry leakage in public or container networks.
+- Retains effortless local developer observability.
+
+---
+
+## ADR 024: Stream Concurrency Permit Retention & Mid-Stream Disconnect Cleanup
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+When streaming responses (`stream: true`), an upstream connection permit is held for the duration of the stream. If a client disconnects mid-stream or the upstream provider stalls indefinitely, orphan tasks ("ghost tasks") could hold concurrency permits, leading to permit exhaustion.
+
+### Decision
+1. **RAII Permit Lifetime:** The upstream concurrency permit is transferred to an RAII guard held by the streaming response body task. The permit is automatically released when the stream finishes or drops.
+2. **Mid-Stream Watchdog:** If client TCP disconnects or if no chunk arrives within the chunk timeout (30s) or TTFB timeout (default 180s for reasoning models, 30s for standard), the streaming task aborts and drops the upstream request immediately.
+
+### Consequences
+**Positive:**
+- Zero permit leakage on client disconnects.
+- Active cancellation of ghost upstream requests saves API billing.
+
+---
+
+## ADR 025: Process-Local File and Directory Permissions Security
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+`libc::umask(0o077)` alters the global umask of the entire OS process. This introduces race conditions when running concurrent tests or when embedding SemCache as a library. SQLite creates its `-wal` and `-shm` files using the filesystem permissions of the parent database file.
+
+### Decision
+1. **Drop Global umask:** Remove all calls to `libc::umask`.
+2. **Process-Local Permissions:** On startup, SemCache verifies and creates the database file with `0600` (`-rw-------`) mode using `std::os::unix::fs::OpenOptionsExt::mode(0o600)` and `std::fs::set_permissions`.
+3. **Directory Permissions:** The containing parent directory is created with `0700` (`drwx------`) mode.
+
+### Consequences
+**Positive:**
+- Eliminates process-wide side effects and test concurrency races.
+- Database, WAL, and SHM files remain strictly accessible only to the executing user.
+
+---
+
+## ADR 026: Upstream Response `Cache-Control: no-store` Compliance
+
+### Status
+**Accepted** (Implemented in Hardening Phase)
+
+### Context
+RFC 9111 specifies that HTTP caches must not store any part of a response if the response contains `Cache-Control: no-store`. Upstream LLM providers or intermediary gateways may mark certain sensitive or transient completions with this directive.
+
+### Decision
+Inspect the HTTP response headers returned by the upstream provider. If `Cache-Control` contains `no-store` (case-insensitive):
+1. Immediately bypass SQLite cache persistence.
+2. Deliver the response to the client with `x-semcache-status: BYPASS_NO_STORE`.
+
+### Consequences
+**Positive:**
+- Full compliance with RFC 9111 response caching semantics.
+- Guarantees upstream privacy directives are strictly respected.
+
 
 
