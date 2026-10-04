@@ -4,6 +4,10 @@
 
 SemCache is an embedded, local-first HTTP reverse proxy gateway designed to sit transparently between client AI applications/agent frameworks and OpenAI-compatible LLM endpoints. It prevents duplicate upstream calls, preserves API rate limits (HTTP 429), and offloads repetitive agent prompts via deterministic canonicalization and sharded single-flight coalescing.
 
+> [!TIP]
+> **New to SemCache or prefer plain English?**  
+> Check out the beginner-friendly [**Plain-English Guide (README.simple.md)**](README.simple.md) for a 60-second quickstart without systems jargon!
+
 ---
 
 ## Explicit Scope: Shipped vs Not Shipped
