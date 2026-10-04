@@ -59,7 +59,8 @@ fn create_test_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         max_request_bytes: 32 * 1024 * 1024,
         max_response_bytes: 10 * 1024 * 1024,
         cancel_orphan_requests: false,
-        deterministic_only: false,
+        conservative_replay: false,
+        upstream_ttfb_secs: 180,
         credential_headers: vec![
             "authorization".to_string(),
             "api-key".to_string(),
@@ -1333,7 +1334,7 @@ async fn test_oversized_response_bypass_and_follower_permit_acquisition() {
     assert_eq!(follower_status, StatusCode::OK);
 
 
-    assert!(state.oversized_bypasses_total.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    assert_eq!(state.oversized_bypasses_total.load(std::sync::atomic::Ordering::Relaxed), 2);
 
     let _ = std::fs::remove_file(db_path);
 }
@@ -1500,8 +1501,8 @@ async fn test_deterministic_only_replay_policy() {
         .await;
 
     let (_old_app, _pool, db_path, mut state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
-    // Enable deterministic-only replay policy
-    state.deterministic_only = true;
+    // Enable conservative replay policy
+    state.conservative_replay = true;
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completion))
         .with_state(state.clone());
@@ -1616,6 +1617,144 @@ async fn test_metrics_endpoint_exposes_counters() {
     assert!(body_str.contains("semcache_consecutive_write_failures 0"));
     assert!(body_str.contains("semcache_circuit_breaker_open 0"));
     assert!(body_str.contains("semcache_dropped_writes_total 0"));
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_upstream_cache_control_no_store_prevents_persistence() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("cache-control", "no-store, no-cache, must-revalidate")
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "Live answer - do not cache" } }]
+                })),
+        )
+        .expect(2) // Upstream MUST be called twice because no-store prevents caching
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, _state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Ephemeral query" }]
+    });
+
+    // Request 1: Should succeed with 200 OK and MISS_UPSTREAM
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-test-key")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp1.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    // Sleep to ensure background persist task would have run if not skipped
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Request 2: Exactly identical query. Because upstream sent no-store, it was not persisted!
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "Bearer sk-test-key")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    // Must be MISS_UPSTREAM, NOT HIT_L1!
+    assert_eq!(resp2.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_multi_header_credential_length_prefix_isolation() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "choices": [{ "message": { "content": "Distinct tenant payload" } }]
+                })),
+        )
+        .expect(2) // Exactly 2 calls: tenant 1 (ab + c) and tenant 2 (a + bc) must NOT collide
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, _state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    let payload = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "Collision probe" }]
+    });
+
+    // Request 1: authorization="ab", api-key="c"
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "ab")
+        .header("api-key", "c")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp1 = app.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+    assert_eq!(resp1.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Request 2: authorization="a", api-key="bc"
+    // Plain concatenation would produce "authorization=ab;api-key=c" and "authorization=a;api-key=bc",
+    // but length-prefixed hashing guarantees zero ambiguity.
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, "a")
+        .header("api-key", "bc")
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::OK);
+    assert_eq!(resp2.headers().get("x-semcache-status").unwrap(), "MISS_UPSTREAM");
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[tokio::test]
+async fn test_metrics_gated_disabled_route() {
+    let mock_server = MockServer::start().await;
+    let (_old_app, _pool, db_path, state) = create_test_app(format!("{}/v1/chat/completions", mock_server.uri()));
+
+    // Router constructed with metrics disabled (as occurs on 0.0.0.0 without SEMCACHE_ENABLE_METRICS=true)
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handle_chat_completion))
+        .route("/healthz", get(semcache::proxy::handle_healthz))
+        .with_state(state);
+
+    let metrics_req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(metrics_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let _ = std::fs::remove_file(db_path);
 }
