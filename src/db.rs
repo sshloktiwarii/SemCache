@@ -10,25 +10,25 @@ pub type DbPool = Pool<SqliteConnectionManager>;
 pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
     #[cfg(unix)]
     {
-        // Enforce strict umask 0077 immediately so any file created by SQLite or this process
-        // (-wal, -shm, temp files) is owner-only read/write (0600) from the very first system call.
-        unsafe {
-            libc::umask(0o077);
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Ensure containing directory has strict 0700 permissions
+        if let Some(parent) = std::path::Path::new(db_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
 
-        // Also pre-create the DB file with 0600 mode if it does not yet exist.
-        if !std::path::Path::new(db_path).exists() {
-            use std::os::unix::fs::OpenOptionsExt;
-            if let Some(parent) = std::path::Path::new(db_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(db_path);
-        }
+        // Pre-create the DB file with 0600 mode if it does not yet exist.
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(db_path);
+
+        // Ensure 0600 permissions are enforced on every startup
+        let _ = std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600));
     }
 
     let manager = SqliteConnectionManager::file(db_path).with_init(|conn| {
@@ -36,7 +36,7 @@ pub fn init_db_pool(db_path: &str) -> Result<DbPool, SemCacheError> {
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
-             PRAGMA temp_store = MEMORY;
+             PRAGMA temp_store = FILE;
              PRAGMA busy_timeout = 5000;",
         )
     });
@@ -278,6 +278,13 @@ pub fn enforce_max_db_size(pool: &DbPool, max_bytes: u64) -> Result<usize, SemCa
     }
 
     Ok(total_deleted)
+}
+
+/// Executes a SQLite VACUUM on a dedicated direct connection off the connection pool.
+pub fn vacuum_db_dedicated(db_path: &str) -> Result<(), SemCacheError> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA busy_timeout = 10000; VACUUM;")?;
+    Ok(())
 }
 
 /// Executes a SQLite VACUUM to defragment storage and reduce database file size.
