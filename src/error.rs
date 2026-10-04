@@ -32,6 +32,9 @@ pub enum SemCacheError {
     #[error("Upstream provider returned status {0}: {1}")]
     UpstreamError(u16, String),
 
+    #[error("Gateway upstream request timed out")]
+    UpstreamTimeout,
+
     #[error("Internal gateway error: {0}")]
     InternalError(String),
 }
@@ -88,6 +91,7 @@ impl IntoResponse for SemCacheError {
                 let status = StatusCode::from_u16(*code).unwrap_or(StatusCode::BAD_GATEWAY);
                 (status, "upstream_error")
             }
+            SemCacheError::UpstreamTimeout => (StatusCode::GATEWAY_TIMEOUT, "timeout_error"),
             SemCacheError::JsonError(_) => (StatusCode::BAD_REQUEST, "invalid_json_error"),
             SemCacheError::DbError(_) | SemCacheError::PoolError(_) | SemCacheError::HttpError(_) | SemCacheError::InternalError(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "gateway_error")

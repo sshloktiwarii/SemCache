@@ -36,7 +36,8 @@ pub struct AppState {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub cancel_orphan_requests: bool,
-    pub deterministic_only: bool,
+    pub conservative_replay: bool,
+    pub upstream_ttfb_secs: u64,
     pub credential_headers: Vec<String>,
     // Observability and Telemetry counters
     pub requests_total: Arc<AtomicU64>,
@@ -135,16 +136,16 @@ where
 
 /// Extracts a canonical multi-header credential salt.
 ///
-/// Salting every credential header present prevents cross-tenant collision
-/// when callers share a gateway Authorization token but differ in per-user api-key headers.
-/// Headers are canonically sorted by lowercase name:
-/// `api-key=val1;authorization=val2;x-api-key=val3;x-goog-api-key=val4`
+/// Salting every credential header present with length-prefixed hashing prevents
+/// cross-tenant collision and eliminates ambiguity (e.g. auth="ab" + api-key="c"
+/// vs auth="a" + api-key="bc").
+/// Each (name, value) pair is sorted and hashed with explicit length prefixes.
 pub fn extract_credential_salt(
     headers: &HeaderMap,
     credential_headers: &[String],
     default_tenant_id: &str,
 ) -> String {
-    let mut present_credentials = Vec::new();
+    let mut present_credentials: Vec<(String, String)> = Vec::new();
 
     for header_name in credential_headers {
         let name_lower = header_name.to_ascii_lowercase();
@@ -158,8 +159,9 @@ pub fn extract_credential_salt(
                 .collect();
             if !vals.is_empty() {
                 vals.sort_unstable();
-                let joined = vals.join(",");
-                present_credentials.push((name_lower, joined));
+                for val in vals {
+                    present_credentials.push((name_lower.clone(), val.to_string()));
+                }
             }
         }
     }
@@ -168,19 +170,26 @@ pub fn extract_credential_salt(
         return default_tenant_id.to_string();
     }
 
-    present_credentials.sort_by(|a, b| a.0.cmp(&b.0));
-    present_credentials
-        .into_iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect::<Vec<_>>()
-        .join(";")
+    // Sort canonically by header name, then value
+    present_credentials.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    // Hash each length-prefixed (name, value) pair using BLAKE3
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"semcache_credential_salt_v2:");
+    for (k, v) in present_credentials {
+        hasher.update(&(k.len() as u64).to_le_bytes());
+        hasher.update(k.as_bytes());
+        hasher.update(&(v.len() as u64).to_le_bytes());
+        hasher.update(v.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
-/// Evaluates whether an LLM request payload is deterministic.
+/// Evaluates whether an LLM request payload is stable/conservative for replay.
 ///
-/// A request is considered deterministic if an explicit `seed` parameter is provided,
+/// A request is considered stable if an explicit `seed` parameter is provided,
 /// or if `temperature` is explicitly set to `0.0`.
-pub fn is_payload_deterministic(payload: &Value) -> bool {
+pub fn is_payload_stable_replay(payload: &Value) -> bool {
     if let Value::Object(map) = payload {
         if map.contains_key("seed") {
             return true;
@@ -192,6 +201,11 @@ pub fn is_payload_deterministic(payload: &Value) -> bool {
         }
     }
     false
+}
+
+#[inline]
+pub fn is_payload_deterministic(payload: &Value) -> bool {
+    is_payload_stable_replay(payload)
 }
 
 /// Health and readiness probe handler.
@@ -287,6 +301,9 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
 
 /// Forwards a request directly to upstream, bypassing cache storage and coalescing.
 /// Used for `Cache-Control: no-store` and for oversized responses (> max_response_bytes).
+///
+/// Under peak saturation where all upstream concurrency permits are held, direct re-forwarding
+/// will wait up to 5s before shedding with HTTP 503 (`Retry-After: 5`), preserving upstream stability.
 pub async fn forward_direct_upstream(
     state: &AppState,
     headers: &HeaderMap,
@@ -319,7 +336,16 @@ pub async fn forward_direct_upstream(
         }
     }
 
-    let upstream_resp = req_builder.body(payload_bytes).send().await?;
+    let upstream_resp = match tokio::time::timeout(
+        Duration::from_secs(state.upstream_ttfb_secs),
+        req_builder.body(payload_bytes).send(),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => return Err(SemCacheError::from(e)),
+        Err(_) => return Err(SemCacheError::UpstreamTimeout),
+    };
     let status = upstream_resp.status();
 
     if !status.is_success() {
@@ -377,8 +403,8 @@ pub async fn handle_chat_completion(
         return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_NO_STORE").await;
     }
 
-    // Deterministic-only replay policy bypass
-    if state.deterministic_only && !is_payload_deterministic(&payload) {
+    // Conservative replay policy bypass
+    if state.conservative_replay && !is_payload_stable_replay(&payload) {
         state.stochastic_bypasses_total.fetch_add(1, Ordering::Relaxed);
         return forward_direct_upstream(&state, &headers, payload_bytes, "BYPASS_STOCHASTIC").await;
     }
@@ -432,7 +458,7 @@ pub async fn handle_chat_completion(
 
         let idle_stream = IdleTimeoutStream::with_permit(
             upstream_resp.bytes_stream(),
-            Duration::from_secs(180),
+            Duration::from_secs(state.upstream_ttfb_secs),
             Duration::from_secs(30),
             Some(upstream_permit),
         );
@@ -542,10 +568,17 @@ pub async fn handle_chat_completion(
                     req_builder = req_builder.header(k, v);
                 }
 
-                let upstream_resp = match req_builder.body(payload_bytes_clone).send().await {
-                    Ok(resp) => resp,
-                    Err(e) => {
+                let upstream_resp = match tokio::time::timeout(
+                    Duration::from_secs(state.upstream_ttfb_secs),
+                    req_builder.body(payload_bytes_clone).send(),
+                ).await {
+                    Ok(Ok(resp)) => resp,
+                    Ok(Err(e)) => {
                         guard.broadcast_error(SemCacheError::from(e));
+                        return;
+                    }
+                    Err(_) => {
+                        guard.broadcast_error(SemCacheError::UpstreamTimeout);
                         return;
                     }
                 };
@@ -557,6 +590,13 @@ pub async fn handle_chat_completion(
                     guard.broadcast_error(SemCacheError::UpstreamError(status.as_u16(), err_msg));
                     return;
                 }
+
+                let resp_no_store = upstream_resp
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.contains("no-store"))
+                    .unwrap_or(false);
 
                 // Enforce response size while streaming chunks to avoid buffering oversized bodies into RAM
                 let content_length = upstream_resp.content_length();
@@ -574,6 +614,12 @@ pub async fn handle_chat_completion(
                 let mut accumulated_bytes = Vec::new();
 
                 while let Some(chunk_res) = stream.next().await {
+                    if cancel_orphan_requests && !guard.has_active_listeners() {
+                        tracing::info!("Ghost task aborted during streaming: 0 active listeners remaining.");
+                        guard.evict();
+                        return;
+                    }
+
                     let chunk = match chunk_res {
                         Ok(c) => c,
                         Err(e) => {
@@ -597,6 +643,13 @@ pub async fn handle_chat_completion(
 
                 // 1. Mark state in InFlightMap as Ready(bytes, timestamp) & broadcast to current subscribers
                 guard.mark_ready_and_broadcast(resp_bytes.clone());
+
+                // RFC 7234: If upstream returns Cache-Control: no-store, do not persist to disk
+                if resp_no_store {
+                    tracing::debug!("Upstream response contains Cache-Control: no-store; skipping persistence and evicting immediately");
+                    guard.evict();
+                    return;
+                }
 
                 // 2. Persist to SQLite WAL with bounded semaphore backpressure and consecutive failure circuit breaker
                 let model = canonical_val_clone

@@ -8,7 +8,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use semcache::{
     coalesce::RequestCoalescer,
-    db::{enforce_max_db_size, init_db_pool, prune_expired_records},
+    db::init_db_pool,
     proxy::{handle_chat_completion, handle_healthz, handle_metrics, AppState},
 };
 
@@ -64,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_db_bytes: u64 = std::env::var("SEMCACHE_MAX_DB_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(10 * 1024 * 1024 * 1024); // 10 GB default storage cap
+        .unwrap_or(2 * 1024 * 1024 * 1024); // 2 GB default storage cap for developer laptops
 
     let max_upstream_concurrency: usize = std::env::var("SEMCACHE_MAX_UPSTREAM_CONCURRENCY")
         .ok()
@@ -76,7 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
 
-    let deterministic_only = std::env::var("SEMCACHE_DETERMINISTIC_ONLY")
+    let conservative_replay = std::env::var("SEMCACHE_CONSERVATIVE_REPLAY")
+        .or_else(|_| std::env::var("SEMCACHE_STABLE_ONLY"))
+        .or_else(|_| std::env::var("SEMCACHE_DETERMINISTIC_ONLY"))
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
 
@@ -93,6 +95,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+
+    let upstream_ttfb_secs: u64 = std::env::var("SEMCACHE_UPSTREAM_TTFB_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180);
+
+    let enable_metrics = match std::env::var("SEMCACHE_ENABLE_METRICS") {
+        Ok(v) => v == "1" || v.to_lowercase() == "true",
+        Err(_) => bind_addr.starts_with("127.0.0.1") || bind_addr.starts_with("localhost"),
+    };
 
     info!("Initializing SQLite WAL persistence layer at absolute path '{}'...", db_path);
     let pool = init_db_pool(&db_path)?;
@@ -118,17 +130,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Background TTL and DB size cap maintenance task running hourly
-    let prune_pool = pool.clone();
+    // Background TTL, DB size cap, and off-path VACUUM maintenance running hourly on a dedicated connection
+    let maintenance_db_path = db_path.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3600));
         loop {
             interval.tick().await;
             info!("Running background cache TTL eviction (TTL: {} days)...", ttl_days);
-            let pool_task = prune_pool.clone();
+            let path_task = maintenance_db_path.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let deleted = prune_expired_records(&pool_task, ttl_days)?;
-                let capped = enforce_max_db_size(&pool_task, max_db_bytes)?;
+                // Open a dedicated connection off the request pool to prevent starving clients or write semaphore
+                let conn = rusqlite::Connection::open(&path_task)?;
+                conn.execute_batch("PRAGMA busy_timeout = 10000;")?;
+
+                let deleted = conn.execute(
+                    "DELETE FROM exact_cache WHERE created_at < datetime('now', ?1)",
+                    [format!("-{} days", ttl_days)],
+                )?;
+                let _ = conn.execute(
+                    "DELETE FROM fuzzy_payloads WHERE created_at < datetime('now', ?1)",
+                    [format!("-{} days", ttl_days)],
+                )?;
+
+                let mut current_bytes = {
+                    let page_count: i64 = conn.query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+                    let page_size: i64 = conn.query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+                    (page_count * page_size) as u64
+                };
+                let mut capped = 0;
+                while current_bytes > max_db_bytes {
+                    let del = conn.execute(
+                        "DELETE FROM exact_cache WHERE canonical_hash IN (
+                            SELECT canonical_hash FROM exact_cache ORDER BY created_at ASC LIMIT 500
+                        )",
+                        [],
+                    )?;
+                    if del == 0 { break; }
+                    capped += del;
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                    let page_count: i64 = conn.query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+                    let page_size: i64 = conn.query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+                    current_bytes = (page_count * page_size) as u64;
+                }
+
+                if deleted > 0 || capped > 0 {
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                    // Periodic non-blocking vacuum on dedicated connection
+                    let _ = conn.execute_batch("VACUUM;");
+                }
+
                 Ok::<_, semcache::error::SemCacheError>((deleted, capped))
             }).await;
 
@@ -184,7 +234,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_request_bytes,
         max_response_bytes,
         cancel_orphan_requests,
-        deterministic_only,
+        conservative_replay,
+        upstream_ttfb_secs,
         credential_headers,
         requests_total: requests_total.clone(),
         l1_hits_total: l1_hits_total.clone(),
@@ -217,11 +268,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completion))
-        .route("/healthz", get(handle_healthz))
-        .route("/metrics", get(handle_metrics))
-        .with_state(state);
+        .route("/healthz", get(handle_healthz));
+
+    if enable_metrics {
+        app = app.route("/metrics", get(handle_metrics));
+    } else {
+        info!("Notice: /metrics endpoint is disabled by default on {}. Set SEMCACHE_ENABLE_METRICS=true to expose metrics.", bind_addr);
+    }
+
+    let app = app.with_state(state);
 
     if bind_addr.starts_with("127.0.0.1") {
         info!("Notice: Bound to loopback interface ({}). In Docker environments, set SEMCACHE_BIND=0.0.0.0:3000 behind a secure reverse proxy.", bind_addr);

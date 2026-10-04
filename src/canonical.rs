@@ -384,6 +384,34 @@ mod tests {
         assert_ne!(res_a.hash, res_b.hash);
     }
 
+    #[test]
+    fn test_multi_header_credential_length_prefix_collision_resistance() {
+        use axum::http::HeaderMap;
+        use crate::proxy::extract_credential_salt;
+
+        let cred_headers = vec!["authorization".to_string(), "api-key".to_string()];
+
+        // Ambiguous pair that would collide under plain concatenation:
+        // Case 1: authorization="ab", api-key="c" -> "ab" + "c"
+        // Case 2: authorization="a", api-key="bc" -> "a" + "bc"
+        let mut headers1 = HeaderMap::new();
+        headers1.insert("authorization", "ab".parse().unwrap());
+        headers1.insert("api-key", "c".parse().unwrap());
+        let salt1 = extract_credential_salt(&headers1, &cred_headers, "default");
+
+        let mut headers2 = HeaderMap::new();
+        headers2.insert("authorization", "a".parse().unwrap());
+        headers2.insert("api-key", "bc".parse().unwrap());
+        let salt2 = extract_credential_salt(&headers2, &cred_headers, "default");
+
+        assert_ne!(salt1, salt2, "Length-prefixed hashing MUST eliminate concatenation ambiguity");
+
+        let payload = br#"{"model":"gpt-4o","prompt":"Test collision"}"#;
+        let res1 = canonicalize_and_hash(payload, Some(&salt1), Provider::OpenAi).unwrap();
+        let res2 = canonicalize_and_hash(payload, Some(&salt2), Provider::OpenAi).unwrap();
+        assert_ne!(res1.hash, res2.hash);
+    }
+
 
     #[test]
     fn test_azure_openai_url_detection() {
