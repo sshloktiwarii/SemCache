@@ -121,36 +121,34 @@ The setting `SEMCACHE_CONSERVATIVE_REPLAY` defaults to **`false`**.
 
 ---
 
-## Architecture Decision Records (ADRs)
+## Key Architectural Decisions
 
-SemCache maintains an append-only ADR register documented in Michael Nygard format in [`decision.md`](decision.md):
-
-- **[ADR 001](decision.md#adr-001-rust-over-gonodejs-for-the-proxy-hot-path):** Rust over Go/Node.js for zero GC pauses on proxy hot paths.
-- **[ADR 002](decision.md#adr-002-embedded-sqlite-with-wal--sqlite-vec-over-external-vector-stores):** Embedded SQLite with WAL mode over external vector DBMS infrastructure.
-- **[ADR 003](decision.md#adr-003-single-flight-request-coalescing-via-dashmap-and-tokio-broadcast):** Single-flight request coalescing via DashMap and Tokio broadcast channels.
-- **[ADR 004](decision.md#adr-004-blake3-as-the-l1-cryptographic-key-derivation-function):** BLAKE3 as the L1 cryptographic key derivation function.
-- **[ADR 005](decision.md#adr-005-strict-rejection-of-server-sent-events-sse-streaming-in-mvp):** Strict rejection of SSE streaming *(Superseded by ADR 010)*.
-- **[ADR 006](decision.md#adr-006-asynchronous-off-critical-path-persistence-to-sqlite):** Asynchronous off-critical-path persistence to SQLite.
-- **[ADR 007](decision.md#adr-007-mandatory-resource-attribution-for-cli-tools):** Mandatory resource attribution for CLI commands.
-- **[ADR 008](decision.md#adr-008-syntax-preserving-non-destructive-canonicalization):** Syntax-preserving non-destructive AST canonicalization.
-- **[ADR 009](decision.md#adr-009-removal-first-atomic-broadcast-in-single-flight-coalescer):** Removal-first atomic broadcast in single-flight coalescer.
-- **[ADR 010](decision.md#adr-010-transparent-non-blocking-streaming-bypass):** Transparent non-blocking streaming bypass with dual-stage timeout.
-- **[ADR 011](decision.md#adr-011-bounded-concurrency-semaphore-for-sqlite-disk-writers):** Bounded concurrency semaphore for SQLite disk writers.
-- **[ADR 012](decision.md#adr-012-provider-aware-default-hyperparameter-normalization):** Provider-aware default hyperparameter normalization.
-- **[ADR 013](decision.md#adr-013-state-gated-in-flight-raii-guard-lifecycle):** State-gated in-flight RAII guard lifecycle.
-- **[ADR 014](decision.md#adr-014-semcache-v11-architectural-blueprint):** SemCache v1.1 architectural blueprint.
-- **[ADR 015](decision.md#adr-015-in-code-recursive-ast-key-sorting-for-feature-unification-immunity):** In-code recursive AST key sorting immune to Cargo feature unification.
-- **[ADR 016](decision.md#adr-016-multi-header-credential-salting-first-match-precedence-and-authoritative-provider-isolation):** Multi-header credential salting precedence *(Superseded by ADR 019)*.
-- **[ADR 017](decision.md#adr-017-fail-open-sqlite-storage-degradation--write-circuit-breaker):** Fail-open SQLite storage degradation & write circuit breaker.
-- **[ADR 018](decision.md#adr-018-gateway-memory-payload-size-and-concurrency-bounds):** Gateway memory, payload size, and concurrency bounds.
-- **[ADR 019](decision.md#adr-019-multi-header-credential-salting--length-prefixed-tenant-isolation):** Multi-header length-prefixed credential salting for collision-proof tenant isolation.
-- **[ADR 020](decision.md#adr-020-circuit-breaker-real-write-errors--automatic-success-recovery):** Circuit breaker real-write error accounting and automatic success recovery.
-- **[ADR 021](decision.md#adr-021-conservative-replay-policy-semcache_conservative_replay):** Conservative replay policy (`SEMCACHE_CONSERVATIVE_REPLAY`) with default `false`.
-- **[ADR 022](decision.md#adr-022-dedicated-connection-off-path-storage-bounding--non-blocking-vacuum):** Dedicated-connection off-path storage bounding & disk-backed vacuum.
-- **[ADR 023](decision.md#adr-023-prometheus-metrics-exposition--loopback-only-security-gating):** Prometheus metrics exposition & loopback-only security gating.
-- **[ADR 024](decision.md#adr-024-stream-concurrency-permit-retention--mid-stream-disconnect-cleanup):** Stream concurrency permit retention & mid-stream disconnect cleanup.
-- **[ADR 025](decision.md#adr-025-process-local-file-and-directory-permissions-security):** Process-local `0600` file and `0700` directory security (dropped process-wide umask).
-- **[ADR 026](decision.md#adr-026-upstream-response-cache-control-no-store-compliance):** Upstream response `Cache-Control: no-store` compliance.
+- **ADR 001:** Rust over Go/Node.js for zero GC pauses on proxy hot paths.
+- **ADR 002:** Embedded SQLite with WAL mode over external vector DBMS infrastructure.
+- **ADR 003:** Single-flight request coalescing via DashMap and Tokio broadcast channels.
+- **ADR 004:** BLAKE3 as the L1 cryptographic key derivation function.
+- **ADR 005:** Strict rejection of SSE streaming *(Superseded by ADR 010)*.
+- **ADR 006:** Asynchronous off-critical-path persistence to SQLite.
+- **ADR 007:** Mandatory resource attribution for CLI commands.
+- **ADR 008:** Syntax-preserving non-destructive AST canonicalization.
+- **ADR 009:** Removal-first atomic broadcast in single-flight coalescer.
+- **ADR 010:** Transparent non-blocking streaming bypass with dual-stage timeout.
+- **ADR 011:** Bounded concurrency semaphore for SQLite disk writers.
+- **ADR 012:** Provider-aware default hyperparameter normalization.
+- **ADR 013:** State-gated in-flight RAII guard lifecycle.
+- **ADR 014:** SemCache v1.1 architectural blueprint.
+- **ADR 015:** In-code recursive AST key sorting immune to Cargo feature unification.
+- **ADR 016:** Multi-header credential salting precedence *(Superseded by ADR 019)*.
+- **ADR 017:** Fail-open SQLite storage degradation & write circuit breaker.
+- **ADR 018:** Gateway memory, payload size, and concurrency bounds.
+- **ADR 019:** Multi-header length-prefixed credential salting for collision-proof tenant isolation.
+- **ADR 020:** Circuit breaker real-write error accounting and automatic success recovery.
+- **ADR 021:** Conservative replay policy (`SEMCACHE_CONSERVATIVE_REPLAY`) with default `false`.
+- **ADR 022:** Dedicated-connection off-path storage bounding & disk-backed vacuum.
+- **ADR 023:** Prometheus metrics exposition & loopback-only security gating.
+- **ADR 024:** Stream concurrency permit retention & mid-stream disconnect cleanup.
+- **ADR 025:** Process-local `0600` file and `0700` directory security (dropped process-wide umask).
+- **ADR 026:** Upstream response `Cache-Control: no-store` compliance.
 
 ---
 
