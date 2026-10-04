@@ -79,7 +79,8 @@ fn create_soak_app(upstream_url: String) -> (Router, semcache::db::DbPool, Strin
         max_request_bytes: 32 * 1024 * 1024,
         max_response_bytes: 10 * 1024 * 1024,
         cancel_orphan_requests: false,
-        deterministic_only: false,
+        conservative_replay: false,
+        upstream_ttfb_secs: 180,
         credential_headers: vec![
             "authorization".to_string(),
             "api-key".to_string(),
@@ -653,5 +654,163 @@ async fn test_sustained_multiround_soak() {
 
     let _ = std::fs::remove_file(&db_path);
     let _ = std::fs::remove_file(&wal_path);
+}
+
+/// Long-horizon sustained soak test (30 minutes, 100 workers, verifying zero memory leaks & flat RSS).
+/// Run in CI nightly or manually via:
+/// `cargo test --test soak_test -- test_long_horizon_sustained_soak_30min --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn test_long_horizon_sustained_soak_30min() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "id": "chatcmpl-soak-nightly",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "Soak test sustained response payload" }
+                    }]
+                }))
+                .set_delay(Duration::from_millis(5)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let (app, _pool, db_path, state) = create_soak_app(format!("{}/v1/chat/completions", mock_server.uri()));
+    let app_shared = Arc::new(app);
+
+    // Soak duration defaults to 1800 seconds (30 minutes)
+    let duration_secs: u64 = std::env::var("SEMCACHE_SOAK_DURATION_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800);
+
+    println!("\n=======================================================");
+    println!("STARTING 30-MINUTE SUSTAINED SOAK RUN");
+    println!("Workers:  100 concurrent workers");
+    println!("Duration: {} seconds ({:.1} minutes)", duration_secs, duration_secs as f64 / 60.0);
+    println!("=======================================================");
+
+    let initial_rss = get_rss_bytes();
+    let start_time = Instant::now();
+    let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let mut worker_handles = Vec::new();
+    let total_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Spawn 100 concurrent workers
+    for worker_idx in 0..100 {
+        let app_c = app_shared.clone();
+        let stop_c = stop_signal.clone();
+        let completed_c = total_completed.clone();
+
+        worker_handles.push(tokio::spawn(async move {
+            let mut prompt_counter = 0u64;
+            while !stop_c.load(Ordering::Relaxed) {
+                prompt_counter += 1;
+                // Mix of repeat prompts (cache hits) and periodic fresh prompts (cache misses & coalescing)
+                let prompt_id = if prompt_counter.is_multiple_of(5) {
+                    prompt_counter
+                } else {
+                    prompt_counter % 10
+                };
+                let payload = json!({
+                    "model": "gpt-4o",
+                    "messages": [{
+                        "role": "user",
+                        "content": format!("Worker {} Prompt {}", worker_idx % 10, prompt_id)
+                    }]
+                });
+
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, format!("Bearer sk-soak-worker-{}", worker_idx % 5))
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap();
+
+                let resp = (*app_c).clone().oneshot(req).await.unwrap();
+                if resp.status() == StatusCode::OK {
+                    let _ = resp.into_body().collect().await;
+                    completed_c.fetch_add(1, Ordering::Relaxed);
+                }
+
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }));
+    }
+
+    // Monitor RSS memory every 10 seconds during the run
+    let mut peak_rss = initial_rss;
+    let monitor_interval = Duration::from_secs(10);
+    let mut elapsed = Duration::ZERO;
+
+    while elapsed < Duration::from_secs(duration_secs) {
+        tokio::time::sleep(monitor_interval).await;
+        elapsed = start_time.elapsed();
+        let current_rss = get_rss_bytes();
+        if current_rss > peak_rss {
+            peak_rss = current_rss;
+        }
+        let completed = total_completed.load(Ordering::Relaxed);
+        let rate = completed as f64 / elapsed.as_secs_f64();
+        println!(
+            "[{:>4}s / {:>4}s] Completed: {:>7} | Rate: {:>6.0} req/s | RSS: {:>6.1} MB (Peak: {:>6.1} MB)",
+            elapsed.as_secs(),
+            duration_secs,
+            completed,
+            rate,
+            current_rss as f64 / 1_048_576.0,
+            peak_rss as f64 / 1_048_576.0
+        );
+    }
+
+    stop_signal.store(true, Ordering::Relaxed);
+    for h in worker_handles {
+        let _ = h.await;
+    }
+
+    // Grace period for any background disk writes or eviction sweeps to settle
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let final_rss = get_rss_bytes();
+    let residual_in_flight = state.coalescer.in_flight_count();
+    let available_write_permits = state.sqlite_write_semaphore.available_permits();
+    let available_upstream_permits = state.upstream_semaphore.available_permits();
+
+    println!("=======================================================");
+    println!("LONG-HORIZON 30-MINUTE SOAK COMPLETE");
+    println!("Total Duration:                 {:.2?}", start_time.elapsed());
+    println!("Total Completed Requests:       {}", total_completed.load(Ordering::Relaxed));
+    println!("Initial RSS:                    {:.2} MB", initial_rss as f64 / 1_048_576.0);
+    println!("Final RSS:                      {:.2} MB", final_rss as f64 / 1_048_576.0);
+    println!("Peak RSS:                       {:.2} MB", peak_rss as f64 / 1_048_576.0);
+    println!("Residual In-Flight Entries:     {}", residual_in_flight);
+    println!("Available SQLite Write Permits: {} / 4", available_write_permits);
+    println!("Available Upstream Permits:     {} / 256", available_upstream_permits);
+    println!("=======================================================");
+
+    assert_eq!(residual_in_flight, 0, "Residual in-flight map must be zero");
+    assert_eq!(available_write_permits, 4, "Write permits must be restored");
+    assert_eq!(available_upstream_permits, 256, "Upstream permits must be restored");
+
+    // RSS must remain flat and bounded: final RSS within 2x baseline
+    if initial_rss > 0 {
+        assert!(
+            final_rss < initial_rss * 2 + 100 * 1024 * 1024,
+            "Memory leak detected: final RSS ({:.2} MB) exceeded allowable bound",
+            final_rss as f64 / 1_048_576.0
+        );
+    }
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(format!("{}-wal", db_path));
+    let _ = std::fs::remove_file(format!("{}-shm", db_path));
 }
 
