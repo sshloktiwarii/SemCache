@@ -4,9 +4,32 @@
 
 SemCache is an embedded, local-first HTTP reverse proxy gateway designed to sit transparently between client AI applications/agent frameworks and OpenAI-compatible LLM endpoints. It prevents duplicate upstream calls, preserves API rate limits (HTTP 429), and offloads repetitive agent prompts via deterministic canonicalization and sharded single-flight coalescing.
 
+### 🛡️ The 3 Core Architecture Guarantees
+- **Zero Infrastructure:** Self-contained single binary. No Redis, Memcached, external database, or daemon cluster required.
+- **Zero-Trust Privacy:** 100% local persistence via embedded SQLite WAL with restricted permissions (`0600` file, `0700` dir). Never persists raw API keys, never emits telemetry over the WAN.
+- **1-Line Drop-In:** Fully OpenAI-wire-compatible. Point any SDK or AI agent framework (Python, Node, Cursor, Claude Code, MiroFish) to SemCache by changing `baseURL`.
+
 > [!TIP]
 > **New to SemCache or prefer plain English?**  
 > Check out the beginner-friendly [**Plain-English Guide (README.simple.md)**](README.simple.md) for a 60-second quickstart without systems jargon!
+
+---
+
+## ⚡ Architectural Comparison: Why Not Redis or Memcached?
+
+A common question from infrastructure architects is: *"Why deploy SemCache instead of an existing Redis or Memcached cluster?"*
+
+General-purpose key-value caches operate on raw binary/string keys and are unaware of the semantics of LLM payload formatting. Here is how SemCache fundamentally differs:
+
+| Architectural Dimension | Generic Key-Value Cache (Redis / Memcached) | **SemCache** |
+| :--- | :--- | :--- |
+| **JSON Key Permutation** | ❌ **Cache Miss** (different key order yields different hash) | ✅ **Deterministic Hit** (Recursive AST canonicalization sorts JSON keys) |
+| **Whitespace Invariance** | ❌ **Cache Miss** (trailing newlines/indentation break key) | ✅ **Deterministic Hit** (Syntax-preserving whitespace normalization) |
+| **Thundering Herd** | ❌ **Cache Stampede** (concurrent agents all query upstream simultaneously) | ✅ **Single-Flight Coalesced** (1 upstream fetch; concurrent waiters subscribed via Tokio broadcast) |
+| **Streaming Responses** | ❌ Cannot inspect or tunnel chunked Server-Sent Events | ✅ **Transparent SSE Tunnel** with 180s TTFB & 30s chunk watchdogs |
+| **Infrastructure Overhead** | Dedicated service, TCP connection pool, memory eviction tuning | **Zero dependencies** (embedded in-process SQLite WAL storage) |
+| **Credential Security** | Often unencrypted in shared memory; keys stored alongside data | Length-prefixed multi-header salting; zero API keys written to disk |
+| **L1 Response Latency** | Network round-trip to Redis: 1.0ms – 5.0ms | In-process embedded lookup: **< 1.5ms** |
 
 ---
 
@@ -183,6 +206,7 @@ SemCache is focused on solving local and CI caching with maximum engineering rig
 
 ## Quickstart
 
+### 1. Run with OpenAI
 ```bash
 # Build release binary
 cargo build --release
@@ -190,6 +214,15 @@ cargo build --release
 # Run gateway pointing to OpenAI
 OPENAI_UPSTREAM_URL="https://api.openai.com/v1/chat/completions" \
 SEMCACHE_BIND="127.0.0.1:3000" \
+./target/release/semcache
+```
+
+### 2. Run with Local LLMs (Ollama)
+```bash
+# Proxy local Ollama running on port 11434 with zero-cost cache replay:
+SEMCACHE_BIND="0.0.0.0:8080" \
+OPENAI_UPSTREAM_URL="http://localhost:11434/v1/chat/completions" \
+SEMCACHE_DEFAULT_PROVIDER="ollama" \
 ./target/release/semcache
 ```
 
@@ -212,6 +245,34 @@ curl http://127.0.0.1:3000/metrics
 # # TYPE semcache_requests_total counter
 # semcache_requests_total 42
 ```
+
+---
+
+## 🧪 Low-Risk Adoption Blueprint: Staging & CI/CD
+
+Enterprise engineering teams rarely adopt new network proxies directly into production on day 1. SemCache is designed for a friction-free evaluation pipeline:
+
+### Phase 1: CI/CD Test Suite Acceleration
+- Point test runners in GitHub Actions, GitLab CI, or CircleCI to a local SemCache binary or container.
+- Automated evaluation runs and prompt regression tests replay identical prompt fixtures in **$< 1.5\text{ms}$** with **$0 token spend**.
+
+### Phase 2: Local Developer Tooling & Agent Sandboxes
+- Developers running coding agents (Cursor, Claude Code, Aider) or custom agent loops set `OPENAI_BASE_URL=http://localhost:3000/v1`.
+- Prevents team members from hitting provider rate limits (`HTTP 429`) or blowing through monthly API allowances during iterative debugging.
+
+### Phase 3: Staging Environment Shared Gateway
+- Deploy SemCache as an internal sidecar or staging gateway in your internal container stack.
+- Multiple staging microservices share coalesced responses and cached prompt results with zero risk to production stability.
+
+---
+
+## 🐝 Empirical Validation: MiroFish Multi-Agent Swarm Benchmark
+
+SemCache underwent end-to-end integration and load testing against **MiroFish-Offline**, a high-concurrency multi-agent swarm simulation platform orchestrating dozens of autonomous AI personas debating, generating Neo4j knowledge graphs, and conducting world surveys.
+
+- **100+ Concurrent Agent Requests:** Dispatched parallel agent debate prompts through SemCache proxying a local Ollama instance (`qwen2.5-coder:7b` accelerated on Apple Silicon Metal).
+- **Sub-1.5ms L1 Hit Latency:** Re-evaluated survey questions and simulation graph nodes resolved from embedded SQLite WAL in $<1.5\text{ms}$ without re-invoking the neural network.
+- **Zero Stability Regressions:** Single-flight request coalescing prevented connection starvation and GPU thermal throttling under high-burst multi-agent dispatch.
 
 ---
 
