@@ -2,7 +2,7 @@
 
 > **Think of SemCache as an instant memory booster for your AI apps: it stops your AI tools and agents from asking the exact same expensive questions twice, cuts your API bills, and answers repeated questions in less than 2 milliseconds.**
 
-### 🛡️ The 3 Core Guarantees
+### The 3 Core Guarantees
 1. **Zero Infrastructure:** A single self-contained binary. No Redis, no external database, no Docker cluster to manage.
 2. **Zero-Trust Privacy:** 100% local on your machine. Everything lives in a private SQLite file (`semcache.db`). Never sends prompts, telemetry, or API keys outside your laptop.
 3. **1-Line Integration:** Works with any OpenAI-compatible app, SDK, or framework (Python, Node, Cursor, LangChain, Claude Code) just by changing the `baseURL`.
@@ -15,7 +15,7 @@ You don't need to be a systems programmer or a Rust expert to use SemCache. This
 
 ---
 
-## 🛑 The Problem: AI Agents Repeat Themselves
+## The Problem: AI Agents Repeat Themselves
 
 When AI agents or automated test suites run, they don't think like humans. They loop:
 - **They retry prompts over and over** while fixing small code bugs or planning next steps.
@@ -29,7 +29,7 @@ Every single prompt you send over the internet:
 
 ---
 
-## ⚡ What SemCache Does (In Plain English)
+## What SemCache Does (In Plain English)
 
 SemCache sits silently on your computer between your app and OpenAI like a smart, lightning-fast memory layer.
 
@@ -56,7 +56,7 @@ SemCache sits silently on your computer between your app and OpenAI like a smart
 
 ---
 
-## 🤔 "Why Not Just Use Redis or Memcached?"
+## "Why Not Just Use Redis or Memcached?"
 
 A lot of developers ask: *"I already have Redis. Why can't I just cache prompts there?"*
 
@@ -64,15 +64,15 @@ Standard caches like Redis or Memcached are built for simple web pages, not AI p
 
 | What Happens In Real AI Apps | What Redis Does | What SemCache Does |
 | :--- | :--- | :--- |
-| **Python or LangChain re-orders keys in JSON** | ❌ **Miss!** Redis treats `{a: 1, b: 2}` and `{b: 2, a: 1}` as different prompts. You pay again. | ✅ **Hit!** SemCache parses JSON and sorts keys so matching questions always hit ($<1.5\text{ms}$). |
-| **SDK adds extra spaces or a newline** | ❌ **Miss!** Redis compares exact characters. One extra space ruins the cache. | ✅ **Hit!** SemCache normalizes whitespace safely without altering your prompt meaning. |
-| **5 parallel agents ask the same prompt at once** | ❌ **Thundering Herd!** All 5 requests slip past Redis before any answer is saved. You pay 5x. | ✅ **Coalesced!** SemCache holds the other 4 requests in memory, calls OpenAI once, and shares the answer. |
-| **Streaming (`stream: true`)** | ❌ Redis cannot stream tokens. | ✅ SemCache passes SSE streams through safely with built-in watchdogs. |
+| **Python or LangChain re-orders keys in JSON** | **Miss!** Redis treats `{a: 1, b: 2}` and `{b: 2, a: 1}` as different prompts. You pay again. | **Hit!** SemCache parses JSON and sorts keys so matching questions always hit ($<1.5\text{ms}$). |
+| **SDK adds extra spaces or a newline** | **Miss!** Redis compares exact characters. One extra space ruins the cache. | **Hit!** SemCache normalizes whitespace safely without altering your prompt meaning. |
+| **5 parallel agents ask the same prompt at once** | **Thundering Herd!** All 5 requests slip past Redis before any answer is saved. You pay 5x. | **Coalesced!** SemCache holds the other 4 requests in memory, calls OpenAI once, and shares the answer. |
+| **Streaming (`stream: true`)** | Redis cannot stream tokens. | SemCache passes SSE streams through safely with built-in watchdogs. |
 | **Setup & Maintenance** | Requires installing Redis server, managing memory, and setting up eviction. | **Zero setup.** Just run `./semcache`. A tiny embedded SQLite database handles everything. |
 
 ---
 
-## 🚀 How to Use SemCache in 3 Steps
+## How to Use SemCache in 3 Steps
 
 ### Step 1: Start SemCache
 Open your terminal and run:
@@ -134,25 +134,25 @@ export OPENAI_BASE_URL="http://localhost:3000/v1"
 
 ---
 
-## 🔍 How to Tell If It's Working
+## How to Tell If It's Working
 
 Every response from SemCache includes a special header called `x-semcache-status`. You can see it in your browser, terminal, or network tab:
 
 | Status Header | What it means |
 | :--- | :--- |
-| `HIT_L1` | ⚡ **Instant Hit!** Returned directly from your computer in $< 1.5\text{ms}$. Cost: **$0**. |
-| `HIT_COALESCED` | 🤝 **Shared Hit!** Another agent asked this at the exact same split-second. Both got the answer, but you only paid once. |
-| `MISS_UPSTREAM` | 🌐 **First Time.** SemCache called OpenAI, answered your app, and remembered the answer for next time. |
-| `BYPASS_STREAM` | 🌊 **Streaming Pass.** Your app requested live streaming tokens; SemCache passed it straight through safely. |
+| `HIT_L1` | **Instant Hit!** Returned directly from your computer in $< 1.5\text{ms}$. Cost: **$0**. |
+| `HIT_COALESCED` | **Shared Hit!** Another agent asked this at the exact same split-second. Both got the answer, but you only paid once. |
+| `MISS_UPSTREAM` | **First Time.** SemCache called OpenAI, answered your app, and remembered the answer for next time. |
+| `BYPASS_STREAM` | **Streaming Pass.** Your app requested live streaming tokens; SemCache passed it straight through safely. |
 
 ---
 
-## 💡 Comparison: With vs Without SemCache
+## Comparison: With vs Without SemCache
 
 | Feature | Without SemCache | With SemCache |
 |---|---|---|
-| **Repeated Prompt Cost** | You pay full price every time 💸 | **$0.00 (100% saved)** 💰 |
-| **Response Latency** | 2,000ms – 6,000ms ⏳ | **0.8ms – 1.5ms** ⚡ |
+| **Repeated Prompt Cost** | You pay full price every time | **$0.00 (100% saved)** |
+| **Response Latency** | 2,000ms - 6,000ms | **0.8ms - 1.5ms** |
 | **5 Concurrent Identical Prompts** | 5 separate paid API calls | **1 call, 4 free instantaneous replays** |
 | **Hitting 429 Rate Limits** | Common during agent loops & CI | **Dramatically reduced** |
 | **Setup Hassle** | N/A | **Change 1 line of code (`baseURL`)** |
@@ -160,7 +160,7 @@ Every response from SemCache includes a special header called `x-semcache-status
 
 ---
 
-## 🧪 Zero-Risk Trial: How Teams Use It in Staging & CI/CD
+## Zero-Risk Trial: How Teams Use It in Staging & CI/CD
 
 Enterprise engineers and team leads often ask: *"How can we test this without risking our production traffic?"*
 
@@ -178,7 +178,7 @@ Here is the exact low-risk path recommended for teams:
 
 ---
 
-## 🐝 Real-World Proof: The MiroFish Multi-Agent Swarm Test
+## Real-World Proof: The MiroFish Multi-Agent Swarm Test
 
 SemCache was stress-tested against **MiroFish**—a multi-agent swarm intelligence framework running dozens of simulated AI personas (executives, engineers, market analysts) debating and writing reports over Neo4j knowledge graphs.
 
@@ -189,7 +189,7 @@ SemCache was stress-tested against **MiroFish**—a multi-agent swarm intelligen
 
 ---
 
-## ❓ Frequently Asked Questions (FAQ)
+## Frequently Asked Questions (FAQ)
 
 #### Q: Does SemCache steal or save my OpenAI API key?
 **No.** SemCache never writes your API keys to disk or sends them anywhere. It only uses a cryptographic fingerprint of your key in memory so that two different users on the same machine never accidentally see each other's answers.
