@@ -1,0 +1,44 @@
+name: SemCache CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test Engine & Proxy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check Formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy (Deny Warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run SemCache Test Suite
+        run: cargo test --verbose
+
+      - name: Secrets Scan
+        run: |
+          if git grep -E "\bsk-[a-zA-Z0-9_-]{20,}" | grep -v -E "sk-(test|mock|tenant|alice|bob|sample|soak|sentinel|shared)"; then
+            echo "ERROR: Potential unredacted production secret detected in working tree!"
+            exit 1
+          fi
+          echo "✓ Secrets scan clean."

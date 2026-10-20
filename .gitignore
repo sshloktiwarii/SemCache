@@ -27,3 +27,4 @@ Cargo.lock
 .env
 .env.*
 *.env
+.DS_Store
