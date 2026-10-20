@@ -28,3 +28,11 @@ Cargo.lock
 .env.*
 *.env
 .DS_Store
+
+# System & temporary files
+*.log
+*.tmp
+*.swp
+__pycache__/
+*.pyc
+.env.local
